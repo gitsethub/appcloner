@@ -1,6 +1,9 @@
 {
-  "latestVersion": "2.1.0",
-  "minRequiredVersion": "2.0.0",
-  "downloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "updateMessage": "发现新版本，请前往下载更新以继续使用。"
+  "latestVersion": "3.1.0",
+  "latestDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
+  "latestUpdateMessage": "3.1.0 带来了全新的 UI 和更快的克隆速度！",
+  
+  "minRequiredVersion": "3.0.0",
+  "minDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
+  "minUpdateMessage": "您的版本过低（低于 3.0.0），必须更新才能继续使用。"
 }
