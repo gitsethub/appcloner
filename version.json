@@ -1,9 +1,9 @@
 {
-  "latestVersion": "1.1.4",
+  "latestVersion": "1.1.5",
   "latestDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "latestUpdateMessage": "v1.1.4版本 新增三种克隆模式，左边导航栏UI优化，唯一编号改为独立数据空间，保存位置改为安装位置。",
+  "latestUpdateMessage": "v1.1.5版本 细节优化！",
   
-  "minRequiredVersion": "1.0.0",
+  "minRequiredVersion": "1.1.1",
   "minDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "minUpdateMessage": "您的版本过低（低于 1.0.0），必须更新才能继续使用。"
+  "minUpdateMessage": "您的版本过低（低于 1.1.1），必须更新才能继续使用。"
 }
