@@ -1,7 +1,7 @@
 {
-  "latestVersion": "1.1.6",
+  "latestVersion": "1.1.7",
   "latestDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "latestUpdateMessage": "v1.1.6版本 固定窗口尺寸，不可再自由拉伸。增加记忆能力，切换页面和关闭窗口等，不再失忆。",
+  "latestUpdateMessage": "v1.1.7版本 新增查找已有的数据空间。",
   
   "minRequiredVersion": "1.1.1",
   "minDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
