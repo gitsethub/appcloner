@@ -1,9 +1,9 @@
 {
-  "latestVersion": "1.1.7",
+  "latestVersion": "2.0.0",
   "latestDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "latestUpdateMessage": "v1.1.7版本 新增查找已有的数据空间。",
+  "latestUpdateMessage": "v2.0.0版本 已修复某克隆应用登录账号就闪退的问题。",
   
-  "minRequiredVersion": "1.1.1",
+  "minRequiredVersion": "1.1.2",
   "minDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "minUpdateMessage": "您的版本过低（低于 1.1.1），必须更新才能继续使用。"
+  "minUpdateMessage": "您的版本过低（低于 1.1.2），必须更新才能继续使用。"
 }
