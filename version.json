@@ -1,9 +1,9 @@
 {
-  "latestVersion": "2.1.0",
+  "latestVersion": "2.1.1",
   "latestDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "latestUpdateMessage": "v2.1.0版本 修复了从 App Store 安装的应用在克隆后无法打开的问题。",
+  "latestUpdateMessage": "v2.1.1版本 优化了克隆流程体验，增强了权限提取容错机制，并新增了针对特定应用的特殊处理逻辑。",
   
-  "minRequiredVersion": "1.1.3",
+  "minRequiredVersion": "1.1.4",
   "minDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "minUpdateMessage": "您的版本过低（低于 1.1.3），必须更新才能继续使用。"
+  "minUpdateMessage": "您的版本过低（低于 1.1.4），必须更新才能继续使用。"
 }
