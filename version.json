@@ -1,9 +1,9 @@
 {
-  "latestVersion": "2.1.1",
+  "latestVersion": "2.1.2",
   "latestDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "latestUpdateMessage": "v2.1.1版本 优化了克隆流程体验，增强了权限提取容错机制，并新增了针对特定应用的特殊处理逻辑。",
+  "latestUpdateMessage": "v2.1.2版本 1.更新作者联系方式。2.App管理权限记录（让应用自动出现在权限列表中）。",
   
-  "minRequiredVersion": "1.1.4",
+  "minRequiredVersion": "1.1.5",
   "minDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "minUpdateMessage": "您的版本过低（低于 1.1.4），必须更新才能继续使用。"
+  "minUpdateMessage": "您的版本过低（低于 1.1.5），必须更新才能继续使用。"
 }
