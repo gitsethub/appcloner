@@ -1,9 +1,9 @@
 {
-  "latestVersion": "2.1.3",
+  "latestVersion": "3.0.0",
   "latestDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "latestUpdateMessage": "v2.1.3版本 化繁为简，清除了一些无用功能，将现有克隆逻辑划分为方案A，为即将加入的新方案做好了前期准备工作。",
+  "latestUpdateMessage": "v3.0.0版本 新增克隆方案B，可以克隆基于谷歌内核开发的应用，例如谷歌浏览器、抖音、千问等。",
   
-  "minRequiredVersion": "1.1.6",
+  "minRequiredVersion": "1.1.7",
   "minDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "minUpdateMessage": "您的版本过低（低于 1.1.6），必须更新才能继续使用。"
+  "minUpdateMessage": "您的版本过低（低于 1.1.7），必须更新才能继续使用。"
 }
