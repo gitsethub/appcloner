@@ -1,7 +1,7 @@
 {
-  "latestVersion": "3.0.1",
+  "latestVersion": "3.1.0",
   "latestDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "latestUpdateMessage": "v3.0.1版本 优化克隆方案A；新增克隆方案B，现可以克隆更多应用了，例如谷歌浏览器、抖音、千问等等。",
+  "latestUpdateMessage": "v3.1.0版本 方案A改为A1，方案B改为B2，新增方案B1。",
   
   "minRequiredVersion": "1.1.7",
   "minDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
