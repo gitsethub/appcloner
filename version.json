@@ -1,9 +1,9 @@
 {
   "latestVersion": "3.2.0",
   "latestDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "latestUpdateMessage": "v3.2.0版本 深度优化重构克隆方案A1；新增克隆方案C1C2。测试2",
+  "latestUpdateMessage": "v3.2.0版本 深度优化重构克隆方案A1；新增克隆方案C1C2。",
   
   "minRequiredVersion": "2.0.0",
   "minDownloadUrl": "https://github.com/gitsethub/appcloner/releases",
-  "minUpdateMessage": "您的版本过低（低于 2.0.0），必须更新才能继续使用。测试2"
+  "minUpdateMessage": "您的版本过低（低于 2.0.0），必须更新才能继续使用。"
 }
