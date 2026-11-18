@@ -1,20 +1,27 @@
+# 将 GitHub main 同步到 GitLab main、Gitee main 和 Gitee master
 name: Sync main
 
+# main 收到提交时自动执行，也支持手动运行
 on:
   push:
     branches:
       - main
+  # 在 Actions 页面提供 Run workflow 手动运行入口
   workflow_dispatch:
     inputs:
+      # 默认不覆盖；仅在已备份、确认以 GitHub 为准时勾选
       overwrite:
         description: "已备份，允许覆盖目标分支历史"
         type: boolean
         required: false
         default: false
 
+# GitHub 临时令牌只需读取源码；目标平台写权限由各自令牌提供
 permissions:
   contents: read
 
+# 避免多轮同步并发推送；不取消正在执行的任务
+# 同组最多保留一个等待运行，更新的等待任务可能替换旧的等待任务
 concurrency:
   group: sync-main
   cancel-in-progress: false
@@ -22,31 +29,46 @@ concurrency:
 jobs:
   sync:
     name: Sync to ${{ matrix.target }}
+    # 使用 GitHub 的 Linux 服务器，不需要本机开机
     runs-on: ubuntu-latest
+    # 每个平台任务最多运行 15 分钟
     timeout-minutes: 15
     strategy:
+      # 一个平台失败，不中断另一个平台
       fail-fast: false
+      # 为两个平台分别创建独立同步任务
       matrix:
         include:
           - target: GitLab
             url: https://gitlab.com/gitsethub/appcloner.git
+            # GitLab 令牌认证可使用 oauth2 作为用户名
             username: oauth2
+            # 对应 GitHub 仓库 Secrets 中的名称，不填写真实令牌
             secret: GITLAB_TOKEN
           - target: Gitee
             url: https://gitee.com/gitsethub/appcloner.git
+            # 必须是创建 Gitee 令牌的实际登录用户名
             username: gitsethub
+            # 对应 GitHub 仓库 Secrets 中的名称
             secret: GITEE_TOKEN
 
     steps:
+      # 第一步：获取 GitHub main 的文件和完整提交历史
       - name: Fetch GitHub main
         shell: bash
         env:
+          # 自动获取当前仓库的“所有者/仓库名”
           SOURCE_REPOSITORY: ${{ github.repository }}
           SYNC_USERNAME: x-access-token
+          # GitHub 自动提供的临时令牌，不用自己创建
           SYNC_TOKEN: ${{ github.token }}
+          # 认证失败直接报错，不等待交互输入
           GIT_TERMINAL_PROMPT: "0"
         run: |
+          # 命令失败、变量未定义或管道出错时停止
           set -euo pipefail
+          # 创建临时认证脚本，运行时从环境变量读取凭证
+          # 不把真实令牌写入仓库；保持下面 SH 结束标记的缩进
           cat > "$RUNNER_TEMP/git-askpass.sh" <<'SH'
           #!/bin/sh
           case "$1" in
@@ -55,34 +77,47 @@ jobs:
             *) exit 1 ;;
           esac
           SH
+          # 仅当前用户可访问认证脚本，并让 Git 使用它
           chmod 700 "$RUNNER_TEMP/git-askpass.sh"
           export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          # 只下载 main，不展开工作目录；没有浅克隆，保留完整历史
           git clone --bare --single-branch --branch main \
             "https://github.com/${SOURCE_REPOSITORY}.git" source.git
 
+      # 第二步：使用各平台凭证推送指定分支
       - name: Push target branches
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           TARGET_URL: ${{ matrix.url }}
           SYNC_USERNAME: ${{ matrix.username }}
+          # 按当前平台配置，从 GitHub Secrets 读取令牌
           SYNC_TOKEN: ${{ secrets[matrix.secret] }}
+          # 自动运行时为空；手动运行时读取覆盖开关
           OVERWRITE: ${{ inputs.overwrite }}
           GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
+          # 未配置目标平台令牌时停止当前任务
           test -n "$SYNC_TOKEN" || {
             echo "Missing target token"
             exit 1
           }
+          # 复用认证脚本，此时使用目标平台的用户名和令牌
           export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
           cd source.git
+          # 默认普通推送，目标分支历史不兼容时拒绝覆盖
           options=()
+          # 仅手动勾选后启用强制推送，可能覆盖目标独有提交历史
           if [ "$OVERWRITE" = "true" ]; then
             options+=(--force)
           fi
+          # 格式为“源分支:目标分支”，两个平台都更新 main
           refs=('refs/heads/main:refs/heads/main')
           if [ "$TARGET" = "Gitee" ]; then
+            # Gitee master 同样接收 GitHub main，兼容旧版 App
             refs+=('refs/heads/main:refs/heads/master')
           fi
+          # 只更新指定分支，不删除其他分支，不额外同步标签或 Release 附件
+          # LFS 实体需要另行同步；推送失败时部分分支仍可能已更新
           git push "${options[@]}" "$TARGET_URL" "${refs[@]}"
