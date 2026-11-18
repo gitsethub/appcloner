@@ -286,7 +286,7 @@ jobs:
                       (item for item in current if item.get("name") == filename), None
                   )
                   if attachment is None:
-                      # 上传成功后读取附件 ID，构造该 Gitee 附件的官方 API 下载地址。
+                      # 上传附件并确认返回结果，再生成与网页附件入口一致的下载地址。
                       attachment = upload(
                           endpoint, token, pathlib.Path("assets") / filename, gitee=True
                       )
@@ -294,8 +294,10 @@ jobs:
                       print(f"Gitee: existing attachment kept: {filename}")
                   if not isinstance(attachment, dict) or attachment.get("id") is None:
                       raise RuntimeError("Gitee attachment response is missing its ID")
-                  attachment_id = quote(attachment["id"])
-                  download_url = f"{endpoint}/{attachment_id}/download"
+                  download_url = (
+                      f"https://gitee.com/gitsethub/appcloner/releases/download/"
+                      f"{quote(tag)}/{quote(filename)}"
+                  )
                   # 公开正文中绝不添加访问令牌；匿名下载权限由 Gitee 仓库设置决定。
                   # 仅替换完全匹配的完整 URL，不处理相对链接或 latest 链接。
                   body = body.replace(asset["browser_download_url"], download_url)
