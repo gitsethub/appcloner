@@ -1,0 +1,88 @@
+name: Sync main
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      overwrite:
+        description: "已备份，允许覆盖目标分支历史"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync to ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: GitLab
+            url: https://gitlab.com/gitsethub/appcloner.git
+            username: oauth2
+            secret: GITLAB_TOKEN
+          - target: Gitee
+            url: https://gitee.com/gitsethub/appcloner.git
+            username: gitsethub
+            secret: GITEE_TOKEN
+
+    steps:
+      - name: Fetch GitHub main
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SYNC_USERNAME: x-access-token
+          SYNC_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/git-askpass.sh" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' "$SYNC_USERNAME" ;;
+            *Password*) printf '%s\n' "$SYNC_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          chmod 700 "$RUNNER_TEMP/git-askpass.sh"
+          export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          git clone --bare --single-branch --branch main \
+            "https://github.com/${SOURCE_REPOSITORY}.git" source.git
+
+      - name: Push target branches
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TARGET_URL: ${{ matrix.url }}
+          SYNC_USERNAME: ${{ matrix.username }}
+          SYNC_TOKEN: ${{ secrets[matrix.secret] }}
+          OVERWRITE: ${{ inputs.overwrite }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          test -n "$SYNC_TOKEN" || {
+            echo "Missing target token"
+            exit 1
+          }
+          export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          cd source.git
+          options=()
+          if [ "$OVERWRITE" = "true" ]; then
+            options+=(--force)
+          fi
+          refs=('refs/heads/main:refs/heads/main')
+          if [ "$TARGET" = "Gitee" ]; then
+            refs+=('refs/heads/main:refs/heads/master')
+          fi
+          git push "${options[@]}" "$TARGET_URL" "${refs[@]}"
