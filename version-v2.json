@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "latestVersion": "4.0.0",
+  "latestUpdateMessage": "新版更新说明。",
+  "minRequiredVersion": "2.0.0",
+  "minUpdateMessage": "您的版本过低，请更新后继续使用。",
+  "downloadURLs": {
+    "entry1": "https://github.com/gitsethub/appcloner/releases",
+    "entry2": "https://gitlab.com/gitsethub/appcloner/-/releases",
+    "entry3": "https://gitee.com/gitsethub/appcloner/releases"
+  }
+}
