@@ -1,0 +1,202 @@
+name: Prepare release rebuild
+
+# 只允许手动运行，不会因提交代码或发布版本而自动执行。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-release-rebuild
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      GL_TOKEN: ${{ secrets.GITLAB_RELEASE_TOKEN }}
+      GE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+
+    steps:
+      - name: Download source files and save release lists
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v gh
+          command -v python3
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import urllib.parse
+          import urllib.request
+
+          root = pathlib.Path("release-rebuild")
+          root.mkdir()
+          quote = lambda value: urllib.parse.quote(str(value), safe="")
+
+          # 仅查询接口，不调用任何创建、更新、删除操作。
+          def get(url, platform):
+              headers = {"User-Agent": "AppCloner-rebuild-prepare"}
+              if platform == "GitHub":
+                  headers["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
+              elif platform == "GitLab":
+                  token = os.environ["GL_TOKEN"]
+                  if not token:
+                      raise RuntimeError("缺少 GITLAB_RELEASE_TOKEN")
+                  headers["PRIVATE-TOKEN"] = token
+              else:
+                  token = os.environ["GE_TOKEN"]
+                  if not token:
+                      raise RuntimeError("缺少 GITEE_TOKEN")
+                  url += ("&" if "?" in url else "?")
+                  url += urllib.parse.urlencode({"access_token": token})
+              try:
+                  request = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(request, timeout=120) as response:
+                      return json.load(response)
+              except Exception:
+                  raise RuntimeError(f"{platform} 查询失败，请检查令牌、权限或网络") from None
+
+          # 完整读取所有分页，避免只拿到第一页历史版本。
+          def pages(url, platform):
+              result = []
+              page = 1
+              while True:
+                  separator = "&" if "?" in url else "?"
+                  batch = get(f"{url}{separator}per_page=100&page={page}", platform)
+                  if not isinstance(batch, list):
+                      raise RuntimeError(f"{platform} 返回的列表格式异常")
+                  result.extend(batch)
+                  if len(batch) < 100:
+                      return result
+                  page += 1
+
+          def save(name, value):
+              (root / name).write_text(
+                  json.dumps(value, ensure_ascii=False, indent=2),
+                  encoding="utf-8",
+              )
+
+          repo = os.environ["GH_REPO"]
+          github = f"https://api.github.com/repos/{repo}"
+          releases = [
+              item for item in pages(f"{github}/releases", "GitHub")
+              if not item.get("draft")
+          ]
+          if not releases:
+              raise RuntimeError("GitHub 已发布版本为空，停止准备")
+
+          total = 0
+          for release in releases:
+              release["assets"] = pages(release["assets_url"], "GitHub")
+              total += sum(asset["size"] for asset in release["assets"])
+
+          save("github-releases.json", releases)
+
+          # 保存目标发行版及附件清单，不下载目标独有安装包，不是完整备份。
+          targets = {
+              "GitLab": "https://gitlab.com/api/v4/projects/gitsethub%2Fappcloner",
+              "Gitee": "https://gitee.com/api/v5/repos/gitsethub/appcloner",
+          }
+          snapshots = {}
+          for platform, base in targets.items():
+              items = pages(f"{base}/releases", platform)
+              for release in items:
+                  if platform == "GitLab":
+                      url = f"{base}/releases/{quote(release['tag_name'])}/assets/links"
+                  else:
+                      url = f"{base}/releases/{release['id']}/attach_files"
+                  release["saved_attachments"] = pages(url, platform)
+              snapshots[platform] = items
+              save(f"{platform.lower()}-releases.json", items)
+
+          # GitHub 附件下载到数字编号目录，避免 Tag 或文件名影响本地路径。
+          manifest = []
+          for release in releases:
+              for asset in release["assets"]:
+                  folder = root / "assets" / str(asset["id"])
+                  folder.mkdir(parents=True)
+                  path = folder / "content"
+                  with path.open("wb") as output:
+                      result = subprocess.run(
+                          [
+                              "gh", "api",
+                              f"repos/{repo}/releases/assets/{asset['id']}",
+                              "-H", "Accept: application/octet-stream",
+                          ],
+                          stdout=output,
+                          stderr=subprocess.PIPE,
+                      )
+                  if result.returncode:
+                      raise RuntimeError(f"附件下载失败：{asset['name']}")
+                  if path.stat().st_size != asset["size"]:
+                      raise RuntimeError(f"附件大小不符：{asset['name']}")
+                  digest = hashlib.sha256()
+                  with path.open("rb") as stream:
+                      for block in iter(lambda: stream.read(1024 * 1024), b""):
+                          digest.update(block)
+                  sha256 = digest.hexdigest()
+                  expected = asset.get("digest")
+                  if expected and expected.startswith("sha256:"):
+                      if expected != f"sha256:{sha256}":
+                          raise RuntimeError(f"附件哈希不符：{asset['name']}")
+                  manifest.append({
+                      "tag": release["tag_name"],
+                      "asset_id": asset["id"],
+                      "name": asset["name"],
+                      "size": asset["size"],
+                      "sha256": sha256,
+                      "github_digest_verified": bool(
+                          expected and expected.startswith("sha256:")
+                      ),
+                      "path": str(path.relative_to(root)),
+                  })
+                  print(f"已准备：{release['tag_name']} / {asset['name']}", flush=True)
+
+          save("manifest.json", manifest)
+          source_tags = {item["tag_name"] for item in releases}
+          report = [
+              "# Release 重建准备结果",
+              "",
+              "**本次没有修改或删除任何发行版、附件、Tag 或代码分支。**",
+              "",
+              f"- GitHub 已发布版本：{len(releases)} 个",
+              f"- 已下载并校验大小的附件：{len(manifest)} 个",
+              f"- 附件总大小：{total / 1024 / 1024:.1f} MiB",
+              "- manifest.json 记录全部附件 SHA256；有 GitHub 原始哈希时已比对。",
+              "- 目标平台仅保存信息清单，尚未备份目标独有的安装包。",
+              "- 尚未核验目标存储剩余容量、Tag 冲突和下载权限。",
+          ]
+          for platform, items in snapshots.items():
+              tags = {item["tag_name"] for item in items}
+              report.extend([
+                  "",
+                  f"## {platform}",
+                  f"- 当前发行版：{len(items)} 个",
+                  "- 缺少版本：" + (", ".join(sorted(source_tags - tags)) or "无"),
+                  "- 目标独有版本：" + (", ".join(sorted(tags - source_tags)) or "无"),
+              ])
+          text = "\n".join(report) + "\n"
+          save("preparation-complete.json", {"complete": True, "repository": repo})
+          (root / "report.md").write_text(text, encoding="utf-8")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as output:
+              output.write(text)
+          PY
+
+      # 将源安装包、校验清单和目标发行版信息保存为可下载的准备包。
+      - name: Save rebuild preparation
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-rebuild-preparation
+          path: release-rebuild/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
