@@ -6,30 +6,212 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: 输入 REBUILD 按 Gitee、GitLab 逐站清空并重建全部 Release 和 Tag，前站失败则停止
+        description: 输入 YES 按 Gitee、GitLab 逐站清空并重建全部 Release 和 Tag，前站失败则停止
         required: true
         type: string
 
 permissions:
   contents: write
 
-concurrency:
-  group: sync-releases-${{ github.repository }}
-  cancel-in-progress: false
-
 jobs:
-  sync:
+  enqueue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Persist release sync event
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          cat > release_sync_queue.py <<'PY'
+          import base64
+          import json
+          import os
+          import random
+          import re
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          class QueueHTTPError(Exception):
+              def __init__(self, status):
+                  super().__init__("Queue HTTP status {}".format(status))
+                  self.status = status
+
+          class EventQueue:
+              branch = "release-sync-events"
+              directory = ".release-sync-events"
+
+              def __init__(self):
+                  repo = os.environ["GH_REPO"]
+                  if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+                      raise ValueError("Invalid repository")
+                  self.base = "https://api.github.com/repos/" + repo
+                  self.headers = {
+                      "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json",
+                      "User-Agent": "release-sync-queue",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  }
+
+              def api(self, method, path, data=None, missing=False):
+                  body = None if data is None else json.dumps(data).encode()
+                  request = urllib.request.Request(self.base + path, data=body,
+                                                   headers=self.headers, method=method)
+                  try:
+                      with urllib.request.urlopen(request, timeout=60) as response:
+                          raw = response.read()
+                      return json.loads(raw) if raw else None
+                  except urllib.error.HTTPError as error:
+                      status = error.code
+                      error.close()
+                      if missing and status == 404:
+                          return None
+                      raise QueueHTTPError(status) from None
+
+              def retry(self, operation):
+                  for attempt in range(6):
+                      try:
+                          return operation()
+                      except QueueHTTPError as error:
+                          if error.status not in (409, 422, 429, 500, 502, 503, 504):
+                              raise
+                      except (urllib.error.URLError, OSError, TimeoutError):
+                          pass
+                      if attempt == 5:
+                          raise RuntimeError("Queue retry limit exceeded") from None
+                      time.sleep(min(2 ** attempt, 16) + random.random())
+
+              def contents_path(self, path):
+                  return "/contents/" + urllib.parse.quote(path, safe="/")
+
+              def contents(self, path):
+                  return self.api("GET", self.contents_path(path) + "?ref=" + self.branch, missing=True)
+
+              def decode(self, blob):
+                  if blob.get("encoding") != "base64":
+                      raise ValueError("Invalid queue encoding")
+                  return json.loads(base64.b64decode(blob["content"]))
+
+              def enqueue(self):
+                  run_id = os.environ["GITHUB_RUN_ID"]
+                  if not re.fullmatch(r"[0-9]+", run_id):
+                      raise ValueError("Invalid run ID")
+                  with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as stream:
+                      event = json.load(stream)
+                  event_name = os.environ["GITHUB_EVENT_NAME"]
+                  confirmation = event.get("inputs", {}).get("confirmation", "")
+                  if event_name not in ("release", "workflow_dispatch"):
+                      raise ValueError("Unsupported event")
+                  if event_name == "workflow_dispatch" and confirmation != "YES":
+                      raise ValueError("YES confirmation required")
+                  record = {"run_id": run_id, "event_name": event_name,
+                            "event": event, "confirmation": confirmation}
+                  def ensure_branch():
+                      if self.api("GET", "/git/ref/heads/" + self.branch, missing=True) is None:
+                          self.api("POST", "/git/refs", {
+                              "ref": "refs/heads/" + self.branch, "sha": os.environ["GITHUB_SHA"]})
+                  self.retry(ensure_branch)
+                  path = self.directory + "/" + run_id + ".json"
+                  def persist():
+                      existing = self.contents(path)
+                      if existing is not None:
+                          if self.decode(existing) != record:
+                              raise ValueError("Queue event already exists with different content")
+                          return
+                      self.api("PUT", self.contents_path(path), {
+                          "message": "Enqueue release sync " + run_id,
+                          "branch": self.branch,
+                          "content": base64.b64encode(json.dumps(record).encode()).decode(),
+                      })
+                  self.retry(persist)
+                  print("Queued release sync " + run_id)
+
+              def pending(self):
+                  reference = self.retry(lambda: self.api("GET", "/git/ref/heads/" + self.branch))
+                  commit = self.retry(lambda: self.api("GET", "/git/commits/" + reference["object"]["sha"]))
+                  root = self.retry(lambda: self.api("GET", "/git/trees/" + commit["tree"]["sha"]))
+                  if root.get("truncated"):
+                      raise ValueError("Truncated queue root tree")
+                  folder = next((item for item in root["tree"] if item["path"] == self.directory), None)
+                  if folder is None:
+                      return []
+                  if folder["type"] != "tree":
+                      raise ValueError("Invalid queue directory")
+                  tree = self.retry(lambda: self.api("GET", "/git/trees/" + folder["sha"]))
+                  if tree.get("truncated"):
+                      raise ValueError("Truncated queue tree")
+                  entries = tree["tree"]
+                  for entry in entries:
+                      if entry["type"] != "blob" or not re.fullmatch(r"[0-9]+\.json", entry["path"]):
+                          raise ValueError("Invalid queue entry")
+                  return sorted(entries, key=lambda entry: int(entry["path"][:-5]))
+
+              def load(self, entry):
+                  blob = self.retry(lambda: self.api("GET", "/git/blobs/" + entry["sha"]))
+                  record = self.decode(blob)
+                  if record["run_id"] + ".json" != entry["path"]:
+                      raise ValueError("Queue event ID mismatch")
+                  return record
+
+              def remove(self, entry):
+                  path = self.directory + "/" + entry["path"]
+                  def delete():
+                      existing = self.contents(path)
+                      if existing is None:
+                          return
+                      if existing["sha"] != entry["sha"]:
+                          raise ValueError("Queue event changed; refusing deletion")
+                      self.api("DELETE", self.contents_path(path), {
+                          "message": "Complete release sync " + entry["path"][:-5],
+                          "branch": self.branch, "sha": entry["sha"],
+                      })
+                  self.retry(delete)
+
+          if __name__ == "__main__":
+              try:
+                  EventQueue().enqueue()
+              except Exception:
+                  print("Release sync enqueue failed; details suppressed")
+                  raise SystemExit(1)
+          PY
+          python3 release_sync_queue.py
+      - name: Upload queue helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-sync-code-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release_sync_queue.py
+          if-no-files-found: error
+          retention-days: 1
+
+  worker:
+    needs: enqueue
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    concurrency:
+      group: sync-releases-${{ github.repository }}
+      cancel-in-progress: false
     steps:
+      - name: Download queue helper
+        uses: actions/download-artifact@v4
+        with:
+          name: release-sync-code-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}
       - name: Sync event release or rebuild mirrors
         shell: bash
+        working-directory: ${{ runner.temp }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           GITLAB_TOKEN: ${{ secrets.GITLAB_RELEASE_TOKEN }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          CONFIRMATION: ${{ inputs.confirmation }}
+          PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -44,6 +226,7 @@ jobs:
           import urllib.parse
           import urllib.request
           import uuid
+          from release_sync_queue import EventQueue
 
           BEGIN = "<!-- release-mirror-downloads:start -->"
           END = "<!-- release-mirror-downloads:end -->"
@@ -53,6 +236,10 @@ jobs:
 
           class MirrorError(Exception):
               pass
+
+          def progress(platform, stage, current=None, total=None):
+              suffix = "" if current is None else " {}/{}".format(current, total)
+              print("[{}] {}{}".format(platform, stage, suffix), flush=True)
 
           class NoRedirect(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -207,10 +394,12 @@ jobs:
 
               def upload(self, path, endpoint):
                   url = self.base + endpoint
+                  checked_url(url)
+                  progress(self.platform, "upload started")
                   if self.platform == "GitLab":
                       url, headers, unused = self.auth("PUT", url)
                       headers.update({"Content-Type": "application/octet-stream", "Content-Length": str(path.stat().st_size)})
-                      response = self.open("PUT", url, chunks(path), headers)
+                      method = "PUT"
                   else:
                       boundary = uuid.uuid4().hex
                       filename = path.name.replace('"', "%22")
@@ -230,9 +419,39 @@ jobs:
                           "Content-Type": "multipart/form-data; boundary=" + boundary,
                           "Content-Length": str(len(prefix) + path.stat().st_size + len(suffix)),
                       }
-                      response = self.open("POST", url, multipart(), headers)
-                  with response:
-                      raw = response.read()
+                      method = "POST"
+                  with tempfile.TemporaryDirectory(prefix="release-upload-") as temporary:
+                      directory = pathlib.Path(temporary)
+                      body = path
+                      if self.platform != "GitLab":
+                          body = directory / "request"
+                          with body.open("wb") as stream:
+                              for block in multipart():
+                                  stream.write(block)
+                      output = directory / "response"
+                      config = ["url = " + json.dumps(url, ensure_ascii=False),
+                                "request = " + json.dumps(method)]
+                      config.extend("header = " + json.dumps(key + ": " + value, ensure_ascii=False)
+                                    for key, value in headers.items())
+                      option = "upload-file" if method == "PUT" else "data-binary"
+                      value = str(body) if method == "PUT" else "@" + str(body)
+                      config.append(option + " = " + json.dumps(value, ensure_ascii=False))
+                      try:
+                          result = subprocess.run(
+                              ["curl", "-q", "--config", "-", "--silent", "--show-error",
+                               "--proto", "=https", "--connect-timeout", "30", "--max-time", "1800",
+                               "--output", str(output), "--write-out", "%{http_code}"],
+                              input=("\n".join(config) + "\n").encode(), stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=1830, check=False)
+                      except (OSError, subprocess.TimeoutExpired):
+                          progress(self.platform, "upload curl_exit=unavailable HTTP=000")
+                          raise MirrorError("Upload process failed") from None
+                      status = result.stdout.decode("ascii", errors="replace").strip()
+                      status = status if re.fullmatch(r"[0-9]{3}", status) else "000"
+                      progress(self.platform, "upload curl_exit={} HTTP={}".format(result.returncode, status))
+                      if result.returncode or not 200 <= int(status) < 300:
+                          raise MirrorError("Upload failed")
+                      raw = output.read_bytes()
                   return json.loads(raw) if raw else None
 
           def validate_releases(releases):
@@ -276,10 +495,12 @@ jobs:
                       folder = self.directory / str(key)
                       folder.mkdir()
                       path = folder / asset["name"]
+                      progress("GitHub", "asset download started")
                       self.github.download(self.github.base + "/releases/assets/" + quote(key), path)
                       if path.stat().st_size != asset["size"]:
                           raise MirrorError("Source asset size mismatch")
                       self.paths[key] = path
+                      progress("GitHub", "asset download completed", len(self.paths), "cached")
                   return self.paths[key]
 
           def git(args, directory, username, token, askpass):
@@ -366,37 +587,61 @@ jobs:
                   for item in client.pages(child):
                       plan["children"].append(child + "/" + quote(item["id"]))
                       if client.platform == "GitLab" and not rebuild:
-                          reference = package_reference(client, item.get("url"), project_id)
-                          if reference:
-                              references.add(reference)
+                          for field in ("url", "direct_asset_url"):
+                              if field == "direct_asset_url" and not item.get(field):
+                                  continue
+                              reference = package_reference(client, item.get(field), project_id)
+                              if reference:
+                                  references.add(reference)
                   plan["releases"].append(endpoint)
               if client.platform == "GitLab":
                   tag = source["tag_name"] if source else None
-                  versions = {tag, package_version(tag), tag[1:] if tag.startswith("v") else tag} if tag else set()
-                  asset_ids = {str(a["id"]) for a in (source or {}).get("assets", [])}
+                  candidates = []
                   for package in client.pages("/packages?package_type=generic"):
                       name, version = package.get("name"), package.get("version")
-                      legacy = re.fullmatch(r"asset-([0-9]+)-[0-9a-fA-F]{64}", version or "")
                       if (package.get("package_type") == "generic" and name in PACKAGE_NAMES
-                              and (rebuild or version in versions or (name, version) in references
-                                   or name == "release-mirror" and legacy and legacy[1] in asset_ids)):
-                          plan["packages"].append("/packages/" + quote(package["id"]))
+                              and (rebuild or (name, version) in references
+                                   or name == "release-mirror" and tag is not None and version == package_version(tag))):
+                          candidates.append(package)
+                  if candidates and not rebuild:
+                      progress(client.platform, "checking package ownership")
+                      selected = {release["tag_name"] for release in releases}
+                      shared = set()
+                      for release in client.pages("/releases"):
+                          if release["tag_name"] in selected:
+                              continue
+                          for item in client.pages("/releases/" + quote(release["tag_name"]) + "/assets/links"):
+                              for field in ("url", "direct_asset_url"):
+                                  if field == "direct_asset_url" and not item.get(field):
+                                      continue
+                                  reference = package_reference(client, item.get(field), project_id)
+                                  if reference:
+                                      shared.add(reference)
+                      if any((package["name"], package["version"]) in shared for package in candidates):
+                          progress(client.platform, "package ownership ambiguous; cleanup blocked")
+                          raise MirrorError("Package referenced by another release")
+                  plan["packages"] = ["/packages/" + quote(package["id"]) for package in candidates]
+              progress(client.platform, "cleanup planned: releases={} children={} packages={}".format(
+                  len(plan["releases"]), len(plan["children"]), len(plan["packages"])))
               return plan
 
           def clean(client, plan, remove_releases):
-              for endpoint in plan["children"] + plan["packages"]:
+              endpoints = plan["children"] + plan["packages"] + (plan["releases"] if remove_releases else [])
+              progress(client.platform, "cleanup started")
+              for index, endpoint in enumerate(endpoints, 1):
                   client.api("DELETE", endpoint, missing=True)
-              if remove_releases:
-                  for endpoint in plan["releases"]:
-                      client.api("DELETE", endpoint, missing=True)
+                  progress(client.platform, "cleanup", index, len(endpoints))
+              progress(client.platform, "cleanup completed")
 
           def mirror(client, release, cache, existing):
               tag = release["tag_name"]
               assets = release["assets"]
+              progress(client.platform, "release sync started")
               if client.platform == "GitLab":
                   endpoint = "/releases/" + quote(tag)
                   urls = {}
-                  for asset in assets:
+                  for index, asset in enumerate(assets, 1):
+                      progress(client.platform, "asset upload", index, len(assets))
                       package = "/packages/generic/release-mirror/{}/{}".format(package_version(tag), quote(asset["name"]))
                       client.upload(cache.path(asset), package)
                       urls[asset["name"]] = client.base + package
@@ -418,11 +663,13 @@ jobs:
                   if existing is None:
                       existing = client.api("POST", "/releases", dict(payload, target_commitish=tag))
                   endpoint = "/releases/" + quote(existing["id"])
-                  for asset in assets:
+                  for index, asset in enumerate(assets, 1):
+                      progress(client.platform, "asset upload", index, len(assets))
                       uploaded = client.upload(cache.path(asset), endpoint + "/attach_files")
                       if not isinstance(uploaded, dict) or uploaded.get("id") is None:
                           raise MirrorError("Invalid upload response")
                   client.api("PATCH", endpoint, payload)
+              progress(client.platform, "release sync completed")
 
           def get_release(client, tag):
               path = "/releases/" if client.platform == "GitLab" else "/releases/tags/"
@@ -451,11 +698,12 @@ jobs:
 
           def sync(github, targets, repo, event_name, event, confirmation):
               rebuild = event_name == "workflow_dispatch"
-              if rebuild and confirmation != "REBUILD":
-                  raise MirrorError("REBUILD confirmation required")
+              if rebuild and confirmation != "YES":
+                  raise MirrorError("YES confirmation required")
               if not rebuild and event_name != "release":
                   raise MirrorError("Unsupported event")
               deleting = not rebuild and event.get("action") in ("deleted", "unpublished")
+              progress("GitHub", "source snapshot started")
               if rebuild:
                   releases = snapshot(github)
                   source = None
@@ -474,11 +722,13 @@ jobs:
                       source["assets"] = github.pages("/releases/{}/assets".format(quote(source["id"])))
                       releases = [source]
                       validate_releases(releases)
+              progress("GitHub", "source snapshot completed", len(releases), "releases")
               if deleting:
                   if not delete_source_tag(github, source):
                       print("Stale deletion event skipped")
                       return
               else:
+                  progress("GitHub", "release descriptions started")
                   for release in releases:
                       urls = {a["name"]: a["browser_download_url"] for a in release["assets"]}
                       body = render_body(release.get("body"), release["assets"], urls)
@@ -490,7 +740,9 @@ jobs:
                   for release in releases:
                       for asset in release["assets"]:
                           cache.path(asset)
+                  progress("GitHub", "git preparation started")
                   bare, askpass = prepare_git(directory, releases, repo, github.token, rebuild)
+                  progress("GitHub", "git preparation completed")
                   if deleting:
                       git(["check-ref-format", "refs/tags/" + source["tag_name"]], bare,
                           "x-access-token", github.token, askpass)
@@ -506,26 +758,33 @@ jobs:
                           return False
                   for client, username in sorted(targets, key=lambda target: {"Gitee": 0, "GitLab": 1}[target[0].platform]):
                       def process():
+                          progress(client.platform, "target processing started")
                           if not valid_token(client.token):
                               raise MirrorError("Missing credentials")
                           if rebuild:
+                              progress(client.platform, "cleanup planning started")
                               current = client.pages("/releases")
                               plan = plan_cleanup(client, current, rebuild=True)
                               refs = target_tags(client, bare, askpass, username)
                               clean(client, plan, remove_releases=True)
+                              progress(client.platform, "tag rebuild started")
                               push_refs(client, bare, askpass, username, [":" + ref for ref in refs])
                               local = git(["for-each-ref", "--format=%(refname)", "refs/tags/"],
                                           bare, "x-access-token", github.token, askpass)
                               if local.strip():
                                   push_refs(client, bare, askpass, username, ["+refs/tags/*:refs/tags/*"])
-                              for release in releases:
+                              progress(client.platform, "tag rebuild completed")
+                              for index, release in enumerate(releases, 1):
+                                  progress(client.platform, "release", index, len(releases))
                                   mirror(client, release, cache, None)
                           else:
                               tag = source["tag_name"]
                               existing = get_release(client, tag)
+                              progress(client.platform, "cleanup planning started")
                               plan = plan_cleanup(client, [existing] if existing else [], source=source)
                               clean(client, plan, remove_releases=deleting)
                               ref = "refs/tags/" + tag
+                              progress(client.platform, "tag sync started")
                               if deleting:
                                   refs = target_tags(client, bare, askpass, username)
                                   if ref in refs:
@@ -545,16 +804,25 @@ jobs:
               token = os.environ.get("GH_TOKEN", "")
               if not valid_token(token):
                   raise MirrorError("Missing GitHub credentials")
-              event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-              confirmation = os.environ.get("CONFIRMATION", "")
-              if event_name == "workflow_dispatch" and confirmation != "REBUILD":
-                  raise MirrorError("REBUILD confirmation required")
-              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as stream:
-                  event = json.load(stream)
               github = Client("GitHub", token, repo)
               targets = [(Client("Gitee", os.environ.get("GITEE_TOKEN", "")), "gitsethub"),
                          (Client("GitLab", os.environ.get("GITLAB_TOKEN", "")), "oauth2")]
-              sync(github, targets, repo, event_name, event, confirmation)
+              queue = EventQueue()
+              while True:
+                  entries = queue.pending()
+                  if not entries:
+                      return
+                  for entry in entries:
+                      print("Processing queued release sync " + entry["path"])
+                      try:
+                          record = queue.load(entry)
+                          sync(github, targets, repo, record["event_name"],
+                               record["event"], record["confirmation"])
+                          queue.remove(entry)
+                      except Exception:
+                          print("Queued release sync failed; retained " + entry["path"])
+                          raise
+                      print("Completed queued release sync " + entry["path"])
 
           if __name__ == "__main__":
               try:
