@@ -1,0 +1,136 @@
+name: Check release tags
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Check published release tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v python3
+          command -v git
+          command -v gh
+
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          repo = os.environ["GH_REPO"]
+
+          def execute(args):
+              result = subprocess.run(
+                  args,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  timeout=180,
+              )
+              if result.returncode:
+                  raise RuntimeError(f"命令执行失败：{args[0]}，请检查网络和仓库读取权限")
+              return result.stdout
+
+          def tags(url):
+              output = execute(["git", "ls-remote", "--tags", url])
+              refs = {}
+              for line in output.splitlines():
+                  commit, ref = line.split(None, 1)
+                  refs[ref] = commit
+              return refs
+
+          def resolved(refs, tag):
+              ref = "refs/tags/" + tag
+              return refs.get(ref + "^{}", refs.get(ref))
+
+          releases = []
+          page = 1
+          while True:
+              batch = json.loads(execute([
+                  "gh", "api",
+                  f"repos/{repo}/releases?per_page=100&page={page}",
+              ]))
+              releases.extend(item for item in batch if not item["draft"])
+              if len(batch) < 100:
+                  break
+              page += 1
+
+          if not releases:
+              raise RuntimeError("GitHub 没有已发布版本，停止检查")
+
+          source = tags(f"https://github.com/{repo}.git")
+          targets = {
+              "GitLab": tags("https://gitlab.com/gitsethub/appcloner.git"),
+              "Gitee": tags("https://gitee.com/gitsethub/appcloner.git"),
+          }
+
+          lines = [
+              "# Release 标签检查结果",
+              "",
+              "**本次未创建、覆盖或删除任何内容。**",
+              "",
+              f"GitHub 已发布版本：{len(releases)} 个",
+              "",
+              "| 版本 | GitLab | Gitee |",
+              "|---|---|---|",
+          ]
+          conflicts = 0
+          missing = 0
+
+          for release in sorted(releases, key=lambda item: item["tag_name"]):
+              tag = release["tag_name"]
+              source_commit = resolved(source, tag)
+              statuses = []
+              for platform, target in targets.items():
+                  target_commit = resolved(target, tag)
+                  if source_commit is None:
+                      status = "❌ GitHub 标签不存在"
+                      conflicts += 1
+                  elif target_commit is None:
+                      status = "➕ 标签缺失，可补建"
+                      missing += 1
+                  elif target_commit != source_commit:
+                      status = (
+                          f"❌ 提交冲突：GitHub {source_commit[:12]} / "
+                          f"目标 {target_commit[:12]}"
+                      )
+                      conflicts += 1
+                  else:
+                      source_object = source.get("refs/tags/" + tag)
+                      target_object = target.get("refs/tags/" + tag)
+                      if source_object != target_object:
+                          status = "❌ 提交一致，但标签对象不同"
+                          conflicts += 1
+                      else:
+                          status = "✅ 一致"
+                  statuses.append(status)
+              safe_tag = tag.replace("|", "&#124;")
+              lines.append(f"| {safe_tag} | {' | '.join(statuses)} |")
+
+          lines.extend([
+              "",
+              f"- 冲突项：{conflicts}",
+              f"- 缺失标签项：{missing}",
+              "- 缺失标签可以在重建时补推送，无需删除其他标签。",
+              "- 标签冲突必须处理后，才能开始清空发行版。",
+              "- 此检查不验证存储剩余容量，也不备份目标独有安装包。",
+          ])
+
+          report = "\n".join(lines) + "\n"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
+              stream.write(report)
+          print(report)
+          if conflicts:
+              raise SystemExit(1)
+          PY
