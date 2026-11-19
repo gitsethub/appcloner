@@ -306,14 +306,27 @@ jobs:
               body = strip_downloads(body or "")
               if not assets:
                   return body
+              source_urls = set(urls.values()) | {asset["browser_download_url"] for asset in assets}
+              remaining = []
+              for line in body.splitlines():
+                  stripped = line.strip()
+                  if re.match(r"^下载链接\s*[:：]", stripped):
+                      continue
+                  if any(url in stripped for url in source_urls):
+                      standalone = stripped.lstrip("- *").strip("`")
+                      if standalone in source_urls or re.fullmatch(r"\[[^\n]*\]\(<?https?://[^\n]+>?\)", standalone):
+                          continue
+                  remaining.append(line)
+              body = "\n".join(remaining).rstrip()
               for asset in sorted(assets, key=lambda item: len(item["browser_download_url"]), reverse=True):
                   body = body.replace(asset["browser_download_url"], urls[asset["name"]])
-              lines = [BEGIN, "## 下载", ""]
+              lines = []
               for asset in assets:
                   name = asset["name"]
                   label = name.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
-                  lines.append("- [{}](<{}>)".format(label, urls[name]))
-              return ((body + "\n\n") if body else "") + "\n".join(lines + [END])
+                  destination = urls[name].replace("(", "%28").replace(")", "%29")
+                  lines.append("下载链接：[{}]({})".format(label, destination))
+              return ((body + "\n\n") if body else "") + "\n".join(lines)
 
           class Client:
               def __init__(self, platform, token, repo=None):
@@ -608,6 +621,10 @@ jobs:
               for release in releases:
                   release["assets"] = github.pages("/releases/{}/assets".format(quote(release["id"])))
               validate_releases(releases)
+              releases.sort(key=lambda release: (
+                  release.get("published_at") or release.get("created_at") or "",
+                  release["id"],
+              ))
               return releases
 
           class AssetCache:
