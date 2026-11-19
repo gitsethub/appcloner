@@ -1,7 +1,7 @@
 # 在 GitHub Actions 左侧显示的任务名称。
 # 用途：将 GitHub 已发布版本的标签、说明和安装包同步到 GitLab、Gitee。
 # 不负责 main/master 分支同步，也不会修改 version.json。
-name: Sync releases
+name: Sync releases2
 
 # 自动触发和手动触发二选一即可运行。
 on:
