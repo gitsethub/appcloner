@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: 输入 YES 按 Gitee、GitLab 逐站清空并重建全部 Release 和 Tag，前站失败则停止
+        description: 输入 YES 按 GitLab、Gitee 逐站清空并重建全部 Release 和 Tag，前站失败则停止
         required: true
         type: string
 
@@ -904,7 +904,7 @@ jobs:
                           failures.append(detail)
                           print(detail, flush=True)
                           return False
-                  for client, username in sorted(targets, key=lambda target: {"Gitee": 0, "GitLab": 1}[target[0].platform]):
+                  for client, username in sorted(targets, key=lambda target: {"GitLab": 0, "Gitee": 1}[target[0].platform]):
                       def process():
                           progress(client.platform, "target processing started")
                           if not valid_token(client.token):
