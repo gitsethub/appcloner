@@ -219,6 +219,7 @@ jobs:
           import os
           import pathlib
           import re
+          import selectors
           import subprocess
           import tempfile
           import time
@@ -337,6 +338,11 @@ jobs:
                   return url, headers, data
 
               def api(self, method, path, data=None, missing=False):
+                  safe_path = json.dumps(urllib.parse.urlsplit(self.base + path).path, ensure_ascii=True)
+                  safe_path = safe_path.replace(self.token, "[redacted]") if self.token else safe_path
+                  stage = "API {} {}{}".format(method, safe_path, " DELETE requested" if method == "DELETE" else "")
+                  started = time.monotonic()
+                  progress(self.platform, stage + " started")
                   url, headers, data = self.auth(method, self.base + path, data)
                   if data is not None:
                       if self.platform == "Gitee":
@@ -345,12 +351,19 @@ jobs:
                       else:
                           data = json.dumps(data).encode()
                           headers["Content-Type"] = "application/json"
-                  response = self.open(method, url, data, headers, missing)
-                  if response is None:
-                      return None
-                  with response:
-                      raw = response.read()
-                  return json.loads(raw) if raw else None
+                  try:
+                      response = self.open(method, url, data, headers, missing)
+                      if response is None:
+                          progress(self.platform, stage + " completed missing elapsed={:.1f}s".format(time.monotonic() - started))
+                          return None
+                      with response:
+                          raw = response.read()
+                      result = json.loads(raw) if raw else None
+                  except Exception:
+                      progress(self.platform, stage + " failed elapsed={:.1f}s".format(time.monotonic() - started))
+                      raise
+                  progress(self.platform, stage + " completed elapsed={:.1f}s".format(time.monotonic() - started))
+                  return result
 
               def pages(self, path):
                   result = []
@@ -365,7 +378,11 @@ jobs:
                           return result
                       page += 1
 
-              def download(self, url, path):
+              def download(self, url, path, size=None):
+                  started = reported = time.monotonic()
+                  received = 0
+                  label = json.dumps(path.name, ensure_ascii=True)
+                  progress(self.platform, "download started file={} size={} elapsed=0s".format(label, size))
                   url, headers, unused = self.auth("GET", url)
                   headers["Accept"] = "application/octet-stream"
                   for redirect in range(6):
@@ -389,13 +406,24 @@ jobs:
                               if not block:
                                   break
                               output.write(block)
+                              received += len(block)
+                              now = time.monotonic()
+                              if now - reported >= 15:
+                                  progress(self.platform, "download running file={} size={} received={} elapsed={:.0f}s".format(
+                                      label, size, received, now - started))
+                                  reported = now
+                      progress(self.platform, "download completed file={} size={} received={} elapsed={:.1f}s".format(
+                          label, size, received, time.monotonic() - started))
                       return
                   raise MirrorError("Too many redirects")
 
               def upload(self, path, endpoint):
                   url = self.base + endpoint
                   checked_url(url)
-                  progress(self.platform, "upload started")
+                  size = path.stat().st_size
+                  label = json.dumps(path.name, ensure_ascii=True)
+                  started = time.monotonic()
+                  progress(self.platform, "upload preparation started file={} size={} elapsed=0s".format(label, size))
                   if self.platform == "GitLab":
                       url, headers, unused = self.auth("PUT", url)
                       headers.update({"Content-Type": "application/octet-stream", "Content-Length": str(path.stat().st_size)})
@@ -425,9 +453,17 @@ jobs:
                       body = path
                       if self.platform != "GitLab":
                           body = directory / "request"
+                          reported = time.monotonic()
                           with body.open("wb") as stream:
                               for block in multipart():
                                   stream.write(block)
+                                  now = time.monotonic()
+                                  if now - reported >= 15:
+                                      progress(self.platform, "upload preparation file={} size={} prepared={} elapsed={:.0f}s".format(
+                                          label, size, stream.tell(), now - started))
+                                      reported = now
+                      progress(self.platform, "upload preparation completed file={} size={} elapsed={:.0f}s".format(
+                          label, size, time.monotonic() - started))
                       output = directory / "response"
                       config = ["url = " + json.dumps(url, ensure_ascii=False),
                                 "request = " + json.dumps(method)]
@@ -436,20 +472,77 @@ jobs:
                       option = "upload-file" if method == "PUT" else "data-binary"
                       value = str(body) if method == "PUT" else "@" + str(body)
                       config.append(option + " = " + json.dumps(value, ensure_ascii=False))
+                      process = None
+                      timed_out = False
+                      status, uploaded, speed, duration = "000", "unavailable", "unavailable", "unavailable"
+                      category = "process"
+                      code = "unavailable"
                       try:
-                          result = subprocess.run(
-                              ["curl", "-q", "--config", "-", "--silent", "--show-error",
-                               "--proto", "=https", "--connect-timeout", "30", "--max-time", "1800",
-                               "--output", str(output), "--write-out", "%{http_code}"],
-                              input=("\n".join(config) + "\n").encode(), stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, timeout=1830, check=False)
-                      except (OSError, subprocess.TimeoutExpired):
-                          progress(self.platform, "upload curl_exit=unavailable HTTP=000")
-                          raise MirrorError("Upload process failed") from None
-                      status = result.stdout.decode("ascii", errors="replace").strip()
-                      status = status if re.fullmatch(r"[0-9]{3}", status) else "000"
-                      progress(self.platform, "upload curl_exit={} HTTP={}".format(result.returncode, status))
-                      if result.returncode or not 200 <= int(status) < 300:
+                          with tempfile.TemporaryFile() as settings, tempfile.TemporaryFile() as metrics:
+                              settings.write(("\n".join(config) + "\n").encode())
+                              settings.seek(0)
+                              started = time.monotonic()
+                              reported = started
+                              transfer = "upload_progress=unavailable"
+                              pending = ""
+                              progress(self.platform, "upload started file={} size={} elapsed=0s".format(label, size))
+                              process = subprocess.Popen(
+                                  ["curl", "-q", "--config", "-", "--progress-meter",
+                                   "--proto", "=https", "--connect-timeout", "30", "--max-time", "600",
+                                   "--speed-limit", "1024", "--speed-time", "60",
+                                   "--output", str(output), "--write-out",
+                                   "%{size_upload} %{speed_upload} %{time_total} %{http_code}"],
+                                  stdin=settings, stdout=metrics, stderr=subprocess.PIPE)
+                              with selectors.DefaultSelector() as selector:
+                                  selector.register(process.stderr, selectors.EVENT_READ)
+                                  while process.poll() is None:
+                                      now = time.monotonic()
+                                      if now - started >= 630:
+                                          timed_out = True
+                                          process.kill()
+                                          break
+                                      if now - reported >= 15:
+                                          progress(self.platform, "upload running file={} size={} elapsed={:.0f}s {}".format(
+                                              label, size, now - started, transfer))
+                                          reported = now
+                                      wait = max(0, min(15 - (now - reported), 630 - (now - started)))
+                                      for key, unused in selector.select(wait):
+                                          block = os.read(key.fd, 8192)
+                                          if not block:
+                                              selector.unregister(key.fileobj)
+                                              continue
+                                          lines = re.split(r"[\r\n]", pending + block.decode("ascii", errors="replace"))
+                                          pending = lines.pop()[-4096:]
+                                          for line in lines:
+                                              fields = line.split()
+                                              if (len(fields) == 12 and all(re.fullmatch(r"[0-9.kMGTPE%:/-]+", field) for field in fields)
+                                                      and re.fullmatch(r"[0-9]{1,3}", fields[4]) and int(fields[4]) <= 100
+                                                      and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?[kMGTPE]?", fields[5])):
+                                                  transfer = "upload_progress={}% sent={}".format(fields[4], fields[5])
+                              code = process.wait()
+                              metrics.seek(0)
+                              values = metrics.read(512).decode("ascii", errors="replace").strip().split()
+                              if (len(values) == 4 and all(re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value) for value in values[:3])
+                                      and re.fullmatch(r"[0-9]{3}", values[3])):
+                                  uploaded, speed, duration, status = values
+                              category = ("outer-timeout" if timed_out else
+                                          {5: "proxy-dns", 6: "dns", 7: "connect", 18: "partial-transfer",
+                                           23: "local-write", 26: "local-read", 28: "timeout-or-low-speed",
+                                           35: "tls", 52: "empty-response", 55: "send", 56: "receive",
+                                           60: "tls-certificate"}.get(code, "curl") if code else
+                                          "http" if not 200 <= int(status) < 300 else "ok")
+                      except OSError:
+                          category = "process-io"
+                      finally:
+                          if process is not None:
+                              if process.poll() is None:
+                                  process.kill()
+                              code = process.wait()
+                              if process.stderr is not None:
+                                  process.stderr.close()
+                      progress(self.platform, "upload completed file={} size={} elapsed={:.0f}s curl_exit={} HTTP={} size_upload={} speed_upload={} time_total={} category={}".format(
+                          label, size, time.monotonic() - started, code, status, uploaded, speed, duration, category))
+                      if category != "ok":
                           raise MirrorError("Upload failed")
                       raw = output.read_bytes()
                   return json.loads(raw) if raw else None
@@ -495,8 +588,7 @@ jobs:
                       folder = self.directory / str(key)
                       folder.mkdir()
                       path = folder / asset["name"]
-                      progress("GitHub", "asset download started")
-                      self.github.download(self.github.base + "/releases/assets/" + quote(key), path)
+                      self.github.download(self.github.base + "/releases/assets/" + quote(key), path, asset["size"])
                       if path.stat().st_size != asset["size"]:
                           raise MirrorError("Source asset size mismatch")
                       self.paths[key] = path
@@ -522,17 +614,23 @@ jobs:
               askpass.write_text('#!/bin/sh\ncase "$1" in\n*Username*) printf "%s\\n" "$SYNC_USERNAME" ;;\n*Password*) printf "%s\\n" "$SYNC_TOKEN" ;;\n*) exit 1 ;;\nesac\n')
               askpass.chmod(0o700)
               bare = directory / "source.git"
+              progress("GitHub", "git init started")
               git(["init", "--bare", "--template=", str(bare)], directory, "x-access-token", token, askpass)
+              progress("GitHub", "git init completed")
               refs = ["refs/tags/" + r["tag_name"] for r in releases]
-              for ref in refs:
+              for index, ref in enumerate(refs, 1):
+                  progress("GitHub", "tag validation", index, len(refs))
                   git(["check-ref-format", ref], bare, "x-access-token", token, askpass)
               specs = ["+refs/tags/*:refs/tags/*"] if rebuild else ["+" + ref + ":" + ref for ref in refs]
               if specs:
+                  progress("GitHub", "tag fetch started")
                   git(["fetch", "--force", "--no-tags", "--no-recurse-submodules",
                        "https://github.com/" + repo + ".git"] + specs,
                       bare, "x-access-token", token, askpass)
-              for ref in refs:
+                  progress("GitHub", "tag fetch completed")
+              for index, ref in enumerate(refs, 1):
                   git(["show-ref", "--verify", ref], bare, "x-access-token", token, askpass)
+                  progress("GitHub", "tag verified", index, len(refs))
               return bare, askpass
 
           def remote_url(client):
@@ -540,6 +638,7 @@ jobs:
               return "https://" + host + "/" + PROJECT + ".git"
 
           def target_tags(client, bare, askpass, username):
+              progress(client.platform, "target tag listing started")
               output = git(["ls-remote", "--tags", "--refs", remote_url(client)],
                            bare, username, client.token, askpass)
               refs = []
@@ -550,12 +649,18 @@ jobs:
                       raise MirrorError("Invalid target tag")
                   git(["check-ref-format", fields[1]], bare, username, client.token, askpass)
                   refs.append(fields[1])
+              progress(client.platform, "target tag listing completed count={}".format(len(refs)))
               return refs
 
           def push_refs(client, bare, askpass, username, specs):
               for offset in range(0, len(specs), 100):
+                  batch = specs[offset:offset + 100]
+                  deleting = sum(spec.startswith(":") for spec in batch)
+                  stage = "tag push batch count={} DELETE={}".format(len(batch), deleting)
+                  progress(client.platform, stage + " started", offset, len(specs))
                   git(["push", "--porcelain", remote_url(client)] + specs[offset:offset + 100],
                       bare, username, client.token, askpass)
+                  progress(client.platform, stage + " completed", offset + len(batch), len(specs))
 
           def package_version(tag):
               return "tag-" + tag.encode("utf-8").hex()
@@ -627,8 +732,9 @@ jobs:
 
           def clean(client, plan, remove_releases):
               endpoints = plan["children"] + plan["packages"] + (plan["releases"] if remove_releases else [])
-              progress(client.platform, "cleanup started")
+              progress(client.platform, "cleanup DELETE started", 0, len(endpoints))
               for index, endpoint in enumerate(endpoints, 1):
+                  progress(client.platform, "cleanup DELETE started", index, len(endpoints))
                   client.api("DELETE", endpoint, missing=True)
                   progress(client.platform, "cleanup", index, len(endpoints))
               progress(client.platform, "cleanup completed")
@@ -725,21 +831,30 @@ jobs:
               progress("GitHub", "source snapshot completed", len(releases), "releases")
               if deleting:
                   if not delete_source_tag(github, source):
-                      print("Stale deletion event skipped")
+                      print("Stale deletion event skipped", flush=True)
                       return
               else:
                   progress("GitHub", "release descriptions started")
-                  for release in releases:
+                  for index, release in enumerate(releases, 1):
+                      progress("GitHub", "release description", index, len(releases))
                       urls = {a["name"]: a["browser_download_url"] for a in release["assets"]}
                       body = render_body(release.get("body"), release["assets"], urls)
                       if body != (release.get("body") or ""):
                           github.api("PATCH", "/releases/" + quote(release["id"]), {"body": body})
+                  progress("GitHub", "release descriptions completed", len(releases), len(releases))
               with tempfile.TemporaryDirectory(prefix="release-mirror-") as temporary:
                   directory = pathlib.Path(temporary)
                   cache = AssetCache(github, directory)
-                  for release in releases:
+                  asset_total = sum(len(release["assets"]) for release in releases)
+                  asset_index = 0
+                  progress("GitHub", "asset preparation started", 0, asset_total)
+                  for index, release in enumerate(releases, 1):
+                      progress("GitHub", "release asset preparation", index, len(releases))
                       for asset in release["assets"]:
+                          asset_index += 1
+                          progress("GitHub", "asset download", asset_index, asset_total)
                           cache.path(asset)
+                  progress("GitHub", "asset preparation completed", asset_total, asset_total)
                   progress("GitHub", "git preparation started")
                   bare, askpass = prepare_git(directory, releases, repo, github.token, rebuild)
                   progress("GitHub", "git preparation completed")
@@ -750,11 +865,11 @@ jobs:
                   def attempt(platform, operation):
                       try:
                           operation()
-                          print(platform + " completed")
+                          print(platform + " completed", flush=True)
                           return True
                       except Exception:
                           failures.append(platform)
-                          print(platform + " failed; details suppressed")
+                          print(platform + " failed; details suppressed", flush=True)
                           return False
                   for client, username in sorted(targets, key=lambda target: {"Gitee": 0, "GitLab": 1}[target[0].platform]):
                       def process():
@@ -791,6 +906,9 @@ jobs:
                                       push_refs(client, bare, askpass, username, [":" + ref])
                               else:
                                   push_refs(client, bare, askpass, username, ["+" + ref + ":" + ref])
+                              progress(client.platform, "tag sync completed")
+                              if not deleting:
+                                  progress(client.platform, "release", 1, 1)
                                   mirror(client, source, cache, existing)
                       if not attempt(client.platform, process) and rebuild:
                           break
@@ -813,21 +931,21 @@ jobs:
                   if not entries:
                       return
                   for entry in entries:
-                      print("Processing queued release sync " + entry["path"])
+                      print("Processing queued release sync " + entry["path"], flush=True)
                       try:
                           record = queue.load(entry)
                           sync(github, targets, repo, record["event_name"],
                                record["event"], record["confirmation"])
                           queue.remove(entry)
                       except Exception:
-                          print("Queued release sync failed; retained " + entry["path"])
+                          print("Queued release sync failed; retained " + entry["path"], flush=True)
                           raise
-                      print("Completed queued release sync " + entry["path"])
+                      print("Completed queued release sync " + entry["path"], flush=True)
 
           if __name__ == "__main__":
               try:
                   run()
               except Exception:
-                  print("Release mirror failed; details suppressed")
+                  print("Release mirror failed; details suppressed", flush=True)
                   raise SystemExit(1)
           PY
