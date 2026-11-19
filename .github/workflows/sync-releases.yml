@@ -2,12 +2,13 @@ name: Sync releases
 
 on:
   release:
+    types: [published, edited, prereleased, released, created, deleted, unpublished]
   workflow_dispatch:
     inputs:
-      force_verify:
-        description: 强制重新下载并校验所有附件
-        type: boolean
-        default: false
+      confirmation:
+        description: 输入 REBUILD 按 Gitee、GitLab 逐站清空并重建全部 Release 和 Tag，前站失败则停止
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -21,19 +22,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Mirror all tags and published releases
+      - name: Sync event release or rebuild mirrors
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           GITLAB_TOKEN: ${{ secrets.GITLAB_RELEASE_TOKEN }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          FORCE_VERIFY: ${{ inputs.force_verify == true && 'true' || 'false' }}
+          CONFIRMATION: ${{ inputs.confirmation }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import base64
-          import hashlib
           import json
           import os
           import pathlib
@@ -48,8 +47,9 @@ jobs:
 
           BEGIN = "<!-- release-mirror-downloads:start -->"
           END = "<!-- release-mirror-downloads:end -->"
-          CHUNK = 1024 * 1024
           PROJECT = "gitsethub/appcloner"
+          CHUNK = 1024 * 1024
+          PACKAGE_NAMES = {"appcloner", "release-mirror"}
 
           class MirrorError(Exception):
               pass
@@ -64,9 +64,9 @@ jobs:
           def checked_url(url):
               parsed = urllib.parse.urlsplit(url)
               if (parsed.scheme != "https" or not parsed.hostname or parsed.username
-                      or parsed.password or parsed.fragment
-                      or any(ord(c) < 32 or ord(c) == 127 for c in url)):
-                  raise MirrorError("Unsafe URL rejected")
+                      or parsed.password or parsed.fragment or "\\" in url
+                      or any(ord(c) < 33 or ord(c) == 127 for c in url)):
+                  raise MirrorError("Unsafe URL")
               return parsed
 
           def origin(url):
@@ -81,19 +81,13 @@ jobs:
                           break
                       yield block
 
-          def file_digest(path):
-              digest = hashlib.sha256()
-              for block in chunks(path):
-                  digest.update(block)
-              return digest.hexdigest()
-
           def strip_downloads(body):
               if body.count(BEGIN) != body.count(END) or body.count(BEGIN) > 1:
-                  raise MirrorError("Malformed managed download section")
+                  raise MirrorError("Malformed download section")
               if BEGIN in body:
                   start, finish = body.index(BEGIN), body.index(END)
                   if finish < start:
-                      raise MirrorError("Malformed managed download section")
+                      raise MirrorError("Malformed download section")
                   body = body[:start] + body[finish + len(END):]
               return body.rstrip()
 
@@ -108,8 +102,7 @@ jobs:
                   name = asset["name"]
                   label = name.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
                   lines.append("- [{}](<{}>)".format(label, urls[name]))
-              lines.append(END)
-              return ((body + "\n\n") if body else "") + "\n".join(lines)
+              return ((body + "\n\n") if body else "") + "\n".join(lines + [END])
 
           class Client:
               def __init__(self, platform, token, repo=None):
@@ -137,13 +130,13 @@ jobs:
                           if method in ("GET", "HEAD") and status in (429, 500, 502, 503, 504) and attempt < 2:
                               time.sleep(2 ** attempt)
                               continue
-                          raise MirrorError(self.platform + " HTTP " + str(status)) from None
+                          raise MirrorError("HTTP request failed") from None
                       except (urllib.error.URLError, OSError, TimeoutError):
-                          raise MirrorError(self.platform + " network request failed") from None
+                          raise MirrorError("Network request failed") from None
 
               def auth(self, method, url, data=None):
                   if origin(url) != origin(self.base):
-                      raise MirrorError("Cross-origin credential use rejected")
+                      raise MirrorError("Cross-origin credential use")
                   headers = {"User-Agent": "release-mirror", "Accept": "application/json"}
                   if self.platform == "GitHub":
                       headers["Authorization"] = "Bearer " + self.token
@@ -179,43 +172,38 @@ jobs:
                       separator = "&" if "?" in path else "?"
                       batch = self.api("GET", path + separator + "per_page=100&page=" + str(page))
                       if not isinstance(batch, list):
-                          raise MirrorError(self.platform + " invalid pagination response")
+                          raise MirrorError("Invalid pagination response")
                       result.extend(batch)
                       if len(batch) < 100:
                           return result
                       page += 1
 
-              def download(self, url, path, authenticated=False, missing=False):
-                  headers = {"User-Agent": "release-mirror", "Accept": "application/octet-stream"}
-                  if authenticated:
-                      url, auth_headers, unused = self.auth("GET", url)
-                      auth_headers["Accept"] = "application/octet-stream"
-                      headers.update(auth_headers)
+              def download(self, url, path):
+                  url, headers, unused = self.auth("GET", url)
+                  headers["Accept"] = "application/octet-stream"
                   for redirect in range(6):
+                      checked_url(url)
                       try:
                           response = self.opener.open(urllib.request.Request(url, headers=headers), timeout=180)
                       except urllib.error.HTTPError as error:
-                          status = error.code
-                          location = error.headers.get("Location")
+                          status, location = error.code, error.headers.get("Location")
                           error.close()
-                          if status == 404 and missing:
-                              return False
                           if status not in (301, 302, 303, 307, 308) or not location:
-                              raise MirrorError(self.platform + " download HTTP " + str(status)) from None
+                              raise MirrorError("Download failed") from None
                           url = urllib.parse.urljoin(url, location)
                           checked_url(url)
                           headers = {"User-Agent": "release-mirror", "Accept": "application/octet-stream"}
                           continue
                       except (urllib.error.URLError, OSError, TimeoutError):
-                          raise MirrorError(self.platform + " download failed") from None
+                          raise MirrorError("Download failed") from None
                       with response, path.open("wb") as output:
                           while True:
                               block = response.read(CHUNK)
                               if not block:
                                   break
                               output.write(block)
-                      return True
-                  raise MirrorError(self.platform + " too many download redirects")
+                      return
+                  raise MirrorError("Too many redirects")
 
               def upload(self, path, endpoint):
                   url = self.base + endpoint
@@ -248,38 +236,51 @@ jobs:
                   return json.loads(raw) if raw else None
 
           def validate_releases(releases):
-              seen = set()
+              tags, ids = set(), set()
               for release in releases:
                   tag = release["tag_name"]
-                  if not isinstance(tag, str) or not tag or tag in seen:
-                      raise MirrorError("Invalid or duplicate source tag")
-                  seen.add(tag)
+                  if not isinstance(tag, str) or not tag or tag in tags:
+                      raise MirrorError("Invalid or duplicate tag")
+                  tags.add(tag)
                   names = set()
                   for asset in release["assets"]:
                       name = asset["name"]
                       if (not isinstance(name, str) or not name or name in (".", "..")
                               or any(c in name for c in '/\\') or name in names
                               or any(ord(c) < 32 or ord(c) == 127 for c in name)):
-                          raise MirrorError("Unsafe or duplicate source filename")
-                      if asset.get("state") != "uploaded" or not isinstance(asset.get("size"), int) or asset["size"] < 0:
-                          raise MirrorError("Source asset not ready")
+                          raise MirrorError("Unsafe or duplicate filename")
+                      if (type(asset.get("id")) is not int or asset["id"] <= 0 or asset["id"] in ids
+                              or asset.get("state") != "uploaded" or type(asset.get("size")) is not int
+                              or asset["size"] < 0):
+                          raise MirrorError("Invalid source asset")
                       if origin(asset["browser_download_url"]) != ("https", "github.com", 443):
-                          raise MirrorError("Unexpected source download origin")
+                          raise MirrorError("Unexpected source URL")
                       names.add(name)
+                      ids.add(asset["id"])
                   strip_downloads(release.get("body") or "")
 
-          def snapshot(client):
-              releases = [r for r in client.pages("/releases") if not r.get("draft")]
+          def snapshot(github):
+              releases = [r for r in github.pages("/releases") if not r.get("draft")]
               for release in releases:
-                  release["assets"] = client.pages("/releases/{}/assets".format(release["id"]))
+                  release["assets"] = github.pages("/releases/{}/assets".format(quote(release["id"])))
               validate_releases(releases)
               return releases
 
-          def signature(releases):
-              return sorted((r["id"], r["tag_name"], r.get("name"), r.get("prerelease"),
-                             r.get("published_at"), strip_downloads(r.get("body") or ""),
-                             sorted((a["id"], a["name"], a["size"], a.get("digest"), a.get("updated_at"))
-                                    for a in r["assets"])) for r in releases)
+          class AssetCache:
+              def __init__(self, github, directory):
+                  self.github, self.directory, self.paths = github, directory, {}
+
+              def path(self, asset):
+                  key = asset["id"]
+                  if key not in self.paths:
+                      folder = self.directory / str(key)
+                      folder.mkdir()
+                      path = folder / asset["name"]
+                      self.github.download(self.github.base + "/releases/assets/" + quote(key), path)
+                      if path.stat().st_size != asset["size"]:
+                          raise MirrorError("Source asset size mismatch")
+                      self.paths[key] = path
+                  return self.paths[key]
 
           def git(args, directory, username, token, askpass):
               env = {key: value for key, value in os.environ.items()
@@ -292,501 +293,273 @@ jobs:
                   cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                   timeout=1800, check=False)
               if result.returncode:
-                  raise MirrorError("Git operation failed; output suppressed")
+                  raise MirrorError("Git operation failed")
               return result.stdout
 
-          def prepare_git(directory, releases, repo, token):
+          def prepare_git(directory, releases, repo, token, rebuild):
               askpass = directory / "askpass"
               askpass.write_text('#!/bin/sh\ncase "$1" in\n*Username*) printf "%s\\n" "$SYNC_USERNAME" ;;\n*Password*) printf "%s\\n" "$SYNC_TOKEN" ;;\n*) exit 1 ;;\nesac\n')
               askpass.chmod(0o700)
               bare = directory / "source.git"
               git(["init", "--bare", "--template=", str(bare)], directory, "x-access-token", token, askpass)
-              git(["fetch", "--force", "--no-recurse-submodules", "https://github.com/" + repo + ".git",
-                   "+refs/tags/*:refs/tags/*"], bare, "x-access-token", token, askpass)
-              for release in releases:
-                  ref = "refs/tags/" + release["tag_name"]
+              refs = ["refs/tags/" + r["tag_name"] for r in releases]
+              for ref in refs:
                   git(["check-ref-format", ref], bare, "x-access-token", token, askpass)
+              specs = ["+refs/tags/*:refs/tags/*"] if rebuild else ["+" + ref + ":" + ref for ref in refs]
+              if specs:
+                  git(["fetch", "--force", "--no-tags", "--no-recurse-submodules",
+                       "https://github.com/" + repo + ".git"] + specs,
+                      bare, "x-access-token", token, askpass)
+              for ref in refs:
                   git(["show-ref", "--verify", ref], bare, "x-access-token", token, askpass)
               return bare, askpass
 
-          def tag_snapshot(bare, username, token, askpass, remote=None):
-              args = (["ls-remote", "--tags", "--refs", remote] if remote else
-                      ["for-each-ref", "--format=%(objectname) %(refname)", "refs/tags/"])
-              result = {}
-              for line in git(args, bare, username, token, askpass).decode("utf-8").splitlines():
+          def remote_url(client):
+              host = "gitlab.com" if client.platform == "GitLab" else "gitee.com"
+              return "https://" + host + "/" + PROJECT + ".git"
+
+          def target_tags(client, bare, askpass, username):
+              output = git(["ls-remote", "--tags", "--refs", remote_url(client)],
+                           bare, username, client.token, askpass)
+              refs = []
+              for line in output.decode().splitlines():
                   fields = line.split()
                   if (len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", fields[0])
-                          or not fields[1].startswith("refs/tags/") or fields[1] in result):
-                      raise MirrorError("Invalid tag snapshot")
-                  result[fields[1]] = fields[0]
-              return result
+                          or not fields[1].startswith("refs/tags/")):
+                      raise MirrorError("Invalid target tag")
+                  git(["check-ref-format", fields[1]], bare, username, client.token, askpass)
+                  refs.append(fields[1])
+              return refs
 
-          def verify_source(github, releases, tags, bare, token, askpass, remote):
-              if (tag_snapshot(bare, "x-access-token", token, askpass, remote) != tags
-                      or signature(snapshot(github)) != signature(releases)):
-                  raise MirrorError("Source changed before cleanup; rerun required")
+          def push_refs(client, bare, askpass, username, specs):
+              for offset in range(0, len(specs), 100):
+                  git(["push", "--porcelain", remote_url(client)] + specs[offset:offset + 100],
+                      bare, username, client.token, askpass)
 
-          def push_tags(client, bare, username, askpass, tags, prune=False):
-              if not tags and not prune:
-                  return
-              host = "gitee.com" if client.platform == "Gitee" else "gitlab.com"
-              args = ["push", "--porcelain"]
-              if prune:
-                  args.append("--prune")
-              args.extend(["https://" + host + "/" + PROJECT + ".git", "+refs/tags/*:refs/tags/*"])
-              git(args, bare, username, client.token, askpass)
-
-          def sha256(value, prefixed=False):
-              pattern = r"sha256:([0-9a-fA-F]{64})" if prefixed else r"([0-9a-fA-F]{64})"
-              match = re.fullmatch(pattern, value) if isinstance(value, str) else None
-              return match[1].lower() if match else None
-
-          class VerificationLedger:
-              branch = "release-sync-state"
-              path = "/contents/release-sync-state.json"
-
-              def __init__(self, github):
-                  self.github = github
-                  self.sha = None
-                  self.branch_exists = False
-                  self.data = {"version": 1, "repository": github.base, "sources": {}, "targets": {}}
-                  response = github.api("GET", self.path + "?ref=" + quote(self.branch), missing=True)
-                  if response is not None:
-                      try:
-                          data = json.loads(base64.b64decode(response["content"], validate=False))
-                          if (response.get("encoding") != "base64" or not response.get("sha")
-                                  or data.get("version") != 1 or data.get("repository") != github.base
-                                  or not isinstance(data.get("sources"), dict)
-                                  or not isinstance(data.get("targets"), dict)):
-                              raise ValueError()
-                      except (ValueError, TypeError, KeyError, AttributeError):
-                          raise MirrorError("Invalid verification ledger; refusing to overwrite") from None
-                      self.data = data
-                      self.sha = response["sha"]
-                      self.branch_exists = True
-                  else:
-                      self.branch_exists = github.api(
-                          "GET", "/git/ref/heads/" + self.branch, missing=True) is not None
-                  self.original = self.serialized()
-
-              def serialized(self):
-                  return json.dumps(self.data, sort_keys=True, separators=(",", ":"))
-
-              def source_fingerprint(self, asset):
-                  if (type(asset.get("id")) is not int or asset["id"] <= 0
-                          or not isinstance(asset.get("updated_at"), str) or not asset["updated_at"]):
-                      return None
-                  return {field: asset.get(field) for field in ("id", "name", "size", "updated_at", "digest")}
-
-              def source_digest(self, asset):
-                  fingerprint = self.source_fingerprint(asset)
-                  record = self.data["sources"].get(str(asset["id"]))
-                  if fingerprint and isinstance(record, dict) and record.get("source") == fingerprint:
-                      return sha256(record.get("sha256"))
-                  return None
-
-              def remember_source(self, asset, digest):
-                  fingerprint = self.source_fingerprint(asset)
-                  if fingerprint:
-                      self.data["sources"][str(asset["id"])] = {"source": fingerprint, "sha256": digest}
-
-              def target_key(self, client, asset):
-                  return json.dumps([client.platform, client.base, asset["id"]], separators=(",", ":"))
-
-              def target_fingerprint(self, item, url):
-                  if (not isinstance(item, dict) or type(item.get("id")) is not int or item["id"] <= 0
-                          or type(item.get("size")) is not int or item["size"] < 0):
-                      return None
-                  fields = ("id", "size", "created_at", "updated_at", "uploaded_at", "package_id",
-                            "package_created_at", "package_updated_at", "url", "download_url",
-                            "browser_download_url", "sha256", "digest", "file_sha256")
-                  return {"url": url, "metadata": {field: item[field] for field in fields if field in item}}
-
-              def reusable(self, client, url, asset, item, digest):
-                  source = self.source_fingerprint(asset)
-                  target = self.target_fingerprint(item, url)
-                  record = self.data["targets"].get(self.target_key(client, asset))
-                  return bool(source and target and isinstance(record, dict)
-                              and record.get("source") == source and record.get("target") == target
-                              and sha256(record.get("sha256")) == digest)
-
-              def forget_target(self, client, asset):
-                  self.data["targets"].pop(self.target_key(client, asset), None)
-
-              def remember_target(self, client, url, asset, item, digest):
-                  source = self.source_fingerprint(asset)
-                  target = self.target_fingerprint(item, url)
-                  if source and target and item["size"] == asset["size"]:
-                      self.data["targets"][self.target_key(client, asset)] = {
-                          "source": source, "target": target, "sha256": digest}
-                      self.remember_source(asset, digest)
-
-              def save(self):
-                  content = self.serialized()
-                  if content == self.original:
-                      return
-                  if not self.branch_exists:
-                      repository = self.github.api("GET", "")
-                      reference = self.github.api("GET", "/git/ref/heads/" + quote(repository["default_branch"]))
-                      self.github.api("POST", "/git/refs", {
-                          "ref": "refs/heads/" + self.branch, "sha": reference["object"]["sha"]})
-                      self.branch_exists = True
-                  payload = {"message": "Update release verification ledger", "branch": self.branch,
-                             "content": base64.b64encode((content + "\n").encode()).decode()}
-                  if self.sha is not None:
-                      payload["sha"] = self.sha
-                  response = self.github.api("PUT", self.path, payload)
-                  self.sha = response["content"]["sha"]
-                  self.original = content
-
-          class AssetCache:
-              def __init__(self, github, directory, ledger=None, force_verify=False):
-                  self.github = github
-                  self.directory = directory
-                  self.ledger = ledger
-                  self.force_verify = force_verify
-                  self.paths = {}
-                  self.digests = {}
-
-              def path(self, asset):
-                  key = asset["id"]
-                  if key not in self.paths:
-                      folder = self.directory / str(key)
-                      folder.mkdir(exist_ok=True)
-                      path = folder / asset["name"]
-                      self.github.download(self.github.base + "/releases/assets/" + quote(key),
-                                           path, authenticated=True)
-                      digest = file_digest(path)
-                      if path.stat().st_size != asset["size"]:
-                          raise MirrorError("GitHub asset size mismatch")
-                      expected = sha256(asset.get("digest"), prefixed=True)
-                      if expected and digest != expected:
-                          raise MirrorError("GitHub asset digest mismatch")
-                      self.paths[key] = path
-                      self.digests[key] = digest
-                      if self.ledger:
-                          self.ledger.remember_source(asset, digest)
-                  return self.paths[key]
-
-              def digest(self, asset):
-                  if self.force_verify:
-                      self.path(asset)
-                      return self.digests[asset["id"]]
-                  expected = sha256(asset.get("digest"), prefixed=True)
-                  if expected:
-                      return expected
-                  if self.ledger:
-                      expected = self.ledger.source_digest(asset)
-                      if expected:
-                          return expected
-                  self.path(asset)
-                  return self.digests[asset["id"]]
-
-              def verified(self, client, url, asset, item, target_digest=None, missing=True):
-                  digest = self.digest(asset)
-                  if (not self.force_verify and self.ledger
-                          and self.ledger.reusable(client, url, asset, item, digest)):
-                      return True
-                  if self.ledger:
-                      self.ledger.forget_target(client, asset)
-                  if item and type(item.get("size")) is int and item["size"] != asset["size"]:
-                      return False
-                  matches = (target_digest == digest if target_digest and not self.force_verify else
-                             self.matches(client, url, asset, missing=missing))
-                  if matches and self.ledger:
-                      self.ledger.remember_target(client, url, asset, item, digest)
-                  return matches
-
-              def remember_upload(self, client, url, asset, item):
-                  if self.ledger:
-                      self.ledger.forget_target(client, asset)
-                  if not self.matches(client, url, asset):
-                      raise MirrorError(client.platform + " uploaded content mismatch")
-                  if self.ledger:
-                      self.ledger.remember_target(client, url, asset, item, self.digest(asset))
-
-              def matches(self, client, url, asset, missing=False):
-                  expected = self.digest(asset)
-                  probe = self.directory / (uuid.uuid4().hex + ".check")
-                  try:
-                      if not client.download(url, probe, authenticated=True, missing=missing):
-                          if missing:
-                              return None
-                          raise MirrorError(client.platform + " verification download missing")
-                      return probe.stat().st_size == asset["size"] and file_digest(probe) == expected
-                  finally:
-                      probe.unlink(missing_ok=True)
-
-          def package_version(asset, digest):
-              return "asset-{}-{}".format(asset["id"], digest)
-
-          def gitlab_file(client, version, asset):
-              packages = client.pages("/packages?" + urllib.parse.urlencode({
-                  "package_type": "generic", "package_name": "release-mirror", "package_version": version}))
-              files = []
-              for package in packages:
-                  if (package.get("name") == "release-mirror" and package.get("version") == version
-                          and package.get("package_type") == "generic"):
-                      if (type(package.get("id")) is not int or package["id"] <= 0
-                              or package.get("status", "default") != "default"):
-                          return None
-                      files.extend(dict(item, package_id=package["id"],
-                                        package_created_at=package.get("created_at"),
-                                        package_updated_at=package.get("updated_at"))
-                                   for item in client.pages("/packages/" + quote(package["id"]) + "/package_files")
-                                   if item.get("file_name") == asset["name"])
-              if len(files) != 1:
-                  return None
-              return files[0]
-
-          def gitlab_file_digest(client, version, asset):
-              item = gitlab_file(client, version, asset)
-              return sha256(item.get("file_sha256")) if item else None
-
-          def plan_gitlab(client, release, cache):
-              tag = release["tag_name"]
-              endpoint = "/releases/" + quote(tag)
-              existing = client.api("GET", endpoint, missing=True)
-              urls = {}
-              uploads = []
-              for asset in release["assets"]:
-                  digest = cache.digest(asset)
-                  version = package_version(asset, digest)
-                  package = "/packages/generic/release-mirror/{}/{}".format(
-                      version, quote(asset["name"]))
-                  url = client.base + package
-                  item = gitlab_file(client, version, asset)
-                  target_digest = sha256(item.get("file_sha256")) if item else None
-                  matches = cache.verified(client, url, asset, item, target_digest)
-                  if matches is False:
-                      raise MirrorError("GitLab immutable package content mismatch")
-                  if matches is None:
-                      cache.path(asset)
-                      uploads.append((asset, package, url))
-                  urls[asset["name"]] = url
-              return existing, urls, uploads
-
-          def mirror_gitlab(client, release, cache, plan=None):
-              existing, urls, uploads = plan if plan is not None else plan_gitlab(client, release, cache)
-              tag = release["tag_name"]
-              endpoint = "/releases/" + quote(tag)
-              for asset, package, url in uploads:
-                  client.upload(cache.path(asset), package)
-                  item = gitlab_file(client, package_version(asset, cache.digest(asset)), asset)
-                  cache.remember_upload(client, url, asset, item)
-              payload = {"name": release.get("name") or tag,
-                         "description": render_body(release.get("body"), release["assets"], urls),
-                         "released_at": release["published_at"]}
-              if existing is None:
-                  client.api("POST", "/releases", dict(payload, tag_name=tag))
-              else:
-                  client.api("PUT", endpoint, payload)
-              current = client.pages(endpoint + "/assets/links")
-              kept = set()
-              for link in current:
-                  name = link.get("name")
-                  if name in urls and name not in kept:
-                      client.api("PUT", endpoint + "/assets/links/" + quote(link["id"]),
-                                 {"name": name, "url": urls[name], "link_type": "package"})
-                      kept.add(name)
-                  else:
-                      client.api("DELETE", endpoint + "/assets/links/" + quote(link["id"]))
-              for name, url in urls.items():
-                  if name not in kept:
-                      client.api("POST", endpoint + "/assets/links", {"name": name, "url": url, "link_type": "package"})
-
-          def plan_gitee(client, release, cache):
-              tag = release["tag_name"]
-              existing = client.api("GET", "/releases/tags/" + quote(tag), missing=True)
-              wanted = {asset["name"]: asset for asset in release["assets"]}
-              urls = {name: "https://gitee.com/" + PROJECT + "/releases/download/" + quote(tag) + "/" + quote(name)
-                      for name in wanted}
-              current = client.pages("/releases/" + quote(existing["id"]) + "/attach_files") if existing else []
-              counts = {}
-              for item in current:
-                  name = item.get("name")
-                  counts[name] = counts.get(name, 0) + 1
-              kept = set()
-              for item in current:
-                  name = item.get("name")
-                  if name in wanted and counts[name] == 1:
-                      asset = wanted[name]
-                      digest = sha256(item.get("sha256")) or sha256(item.get("digest"), prefixed=True)
-                      if cache.verified(client, urls[name], asset, item, digest):
-                          kept.add(name)
-              for name, asset in wanted.items():
-                  if name not in kept:
-                      if cache.ledger:
-                          cache.ledger.forget_target(client, asset)
-                      cache.path(asset)
-              return existing, urls, current, kept
-
-          def mirror_gitee(client, release, cache, plan=None):
-              existing, urls, current, kept = plan if plan is not None else plan_gitee(client, release, cache)
-              tag = release["tag_name"]
-              wanted = {asset["name"]: asset for asset in release["assets"]}
-              payload = {"tag_name": tag, "name": release.get("name") or tag,
-                         "body": render_body(release.get("body"), release["assets"], urls),
-                         "prerelease": str(bool(release.get("prerelease"))).lower()}
-              if existing is None:
-                  existing = client.api("POST", "/releases", dict(payload, target_commitish=tag))
-              endpoint = "/releases/" + quote(existing["id"])
-              attachments = endpoint + "/attach_files"
-              for item in current:
-                  if item.get("name") not in kept:
-                      client.api("DELETE", attachments + "/" + quote(item["id"]))
-              for name, asset in wanted.items():
-                  if name not in kept:
-                      uploaded = client.upload(cache.path(asset), attachments)
-                      if not isinstance(uploaded, dict) or uploaded.get("id") is None:
-                          raise MirrorError("Gitee upload response missing attachment ID")
-                      items = client.pages(attachments)
-                      matching = [item for item in items if item.get("name") == name]
-                      item = matching[0] if len(matching) == 1 and matching[0].get("id") == uploaded["id"] else None
-                      cache.remember_upload(client, urls[name], asset, item)
-              client.api("PATCH", endpoint, payload)
-
-          def prune(client, tags, verify):
-              deletions = []
-              for release in client.pages("/releases"):
-                  if release["tag_name"] not in tags:
-                      key = release["tag_name"] if client.platform == "GitLab" else release["id"]
-                      endpoint = "/releases/" + quote(key)
-                      if client.platform == "Gitee":
-                          attachments = endpoint + "/attach_files"
-                          for item in client.pages(attachments):
-                              deletions.append(attachments + "/" + quote(item["id"]))
-                      deletions.append(endpoint)
-              verify()
-              for endpoint in deletions:
-                  client.api("DELETE", endpoint)
+          def package_version(tag):
+              return "tag-" + tag.encode("utf-8").hex()
 
           def package_reference(client, url, project_id):
-              try:
-                  if not isinstance(url, str) or not url or url != url.strip() or "\\" in url:
-                      raise ValueError()
-                  parsed = checked_url(url)
-                  if origin(url) != origin(client.base):
-                      return None
-                  if "packages" not in urllib.parse.unquote(parsed.path, errors="strict"):
-                      return None
-                  if parsed.query or re.search(r"%(?![0-9a-fA-F]{2})", parsed.path):
-                      raise ValueError()
-                  parts = [urllib.parse.unquote(part, errors="strict") for part in parsed.path.split("/")]
-                  if (len(parts) != 10 or parts[:4] != ["", "api", "v4", "projects"]
-                          or parts[4] not in (PROJECT, str(project_id))
-                          or parts[5:7] != ["packages", "generic"]
-                          or any(not part or part in (".", "..") or "%" in part
-                                 or any(ord(c) < 32 or ord(c) == 127 for c in part)
-                                 for part in parts[7:])
-                          or any("/" in part or "\\" in part for part in parts[7:9])):
-                      raise ValueError()
-                  return parts[7], parts[8]
-              except (ValueError, TypeError, UnicodeError, MirrorError):
-                  raise MirrorError("Ambiguous Release package URL; cleanup refused") from None
+              if not isinstance(url, str) or not url:
+                  raise MirrorError("Invalid package link")
+              parsed = checked_url(url)
+              if origin(url) != origin(client.base):
+                  return None
+              parts = [urllib.parse.unquote(part, errors="strict") for part in parsed.path.split("/")]
+              if "packages" not in parts:
+                  return None
+              if (len(parts) != 10 or parts[:4] != ["", "api", "v4", "projects"]
+                      or parts[4] not in (PROJECT, str(project_id)) or parts[5:7] != ["packages", "generic"]
+                      or parsed.query or any(not part or part in (".", "..") or "%" in part
+                                           or "/" in part or "\\" in part for part in parts[7:9])):
+                  raise MirrorError("Ambiguous package link")
+              return parts[7], parts[8]
 
-          def prune_gitlab_packages(client, releases, cache, verify):
-              retained = {("release-mirror", package_version(asset, cache.digest(asset)))
-                          for release in releases for asset in release["assets"]}
-              packages = client.pages("/packages?package_type=generic")
-              project_id = client.api("GET", "")["id"]
-              if type(project_id) is not int or project_id <= 0:
-                  raise MirrorError("Invalid GitLab project ID")
-              for release in client.pages("/releases"):
-                  links = client.pages("/releases/" + quote(release["tag_name"]) + "/assets/links")
-                  for link in links:
-                      if not isinstance(link.get("url"), str) or not link["url"]:
-                          raise MirrorError("Missing Release link URL; cleanup refused")
-                      for field in ("url", "direct_asset_url"):
-                          if field in link:
-                              reference = package_reference(client, link[field], project_id)
-                              if reference:
-                                  retained.add(reference)
-              deletions = []
-              for package in packages:
-                  if (package.get("name") in ("release-mirror", "appcloner")
-                          and package.get("package_type") == "generic"
-                          and (package["name"], package.get("version")) not in retained):
-                      if (type(package.get("id")) is not int or package["id"] <= 0
-                              or not isinstance(package.get("version"), str) or not package["version"]):
-                          raise MirrorError("Invalid package metadata; cleanup refused")
-                      deletions.append("/packages/" + quote(package["id"]))
-              verify()
-              for endpoint in deletions:
-                  client.api("DELETE", endpoint)
+          def plan_cleanup(client, releases, rebuild=False, source=None):
+              plan = {"releases": [], "children": [], "packages": []}
+              references = set()
+              project_id = client.api("GET", "")["id"] if client.platform == "GitLab" else None
+              for release in releases:
+                  key = release["tag_name"] if client.platform == "GitLab" else release["id"]
+                  endpoint = "/releases/" + quote(key)
+                  child = endpoint + ("/assets/links" if client.platform == "GitLab" else "/attach_files")
+                  for item in client.pages(child):
+                      plan["children"].append(child + "/" + quote(item["id"]))
+                      if client.platform == "GitLab" and not rebuild:
+                          reference = package_reference(client, item.get("url"), project_id)
+                          if reference:
+                              references.add(reference)
+                  plan["releases"].append(endpoint)
+              if client.platform == "GitLab":
+                  tag = source["tag_name"] if source else None
+                  versions = {tag, package_version(tag), tag[1:] if tag.startswith("v") else tag} if tag else set()
+                  asset_ids = {str(a["id"]) for a in (source or {}).get("assets", [])}
+                  for package in client.pages("/packages?package_type=generic"):
+                      name, version = package.get("name"), package.get("version")
+                      legacy = re.fullmatch(r"asset-([0-9]+)-[0-9a-fA-F]{64}", version or "")
+                      if (package.get("package_type") == "generic" and name in PACKAGE_NAMES
+                              and (rebuild or version in versions or (name, version) in references
+                                   or name == "release-mirror" and legacy and legacy[1] in asset_ids)):
+                          plan["packages"].append("/packages/" + quote(package["id"]))
+              return plan
+
+          def clean(client, plan, remove_releases):
+              for endpoint in plan["children"] + plan["packages"]:
+                  client.api("DELETE", endpoint, missing=True)
+              if remove_releases:
+                  for endpoint in plan["releases"]:
+                      client.api("DELETE", endpoint, missing=True)
+
+          def mirror(client, release, cache, existing):
+              tag = release["tag_name"]
+              assets = release["assets"]
+              if client.platform == "GitLab":
+                  endpoint = "/releases/" + quote(tag)
+                  urls = {}
+                  for asset in assets:
+                      package = "/packages/generic/release-mirror/{}/{}".format(package_version(tag), quote(asset["name"]))
+                      client.upload(cache.path(asset), package)
+                      urls[asset["name"]] = client.base + package
+                  payload = {"name": release.get("name") or tag,
+                             "description": render_body(release.get("body"), assets, urls),
+                             "released_at": release["published_at"]}
+                  if existing is None:
+                      client.api("POST", "/releases", dict(payload, tag_name=tag))
+                  else:
+                      client.api("PUT", endpoint, payload)
+                  for name, url in urls.items():
+                      client.api("POST", endpoint + "/assets/links", {"name": name, "url": url, "link_type": "package"})
+              else:
+                  urls = {a["name"]: "https://gitee.com/" + PROJECT + "/releases/download/" + quote(tag) + "/" + quote(a["name"])
+                          for a in assets}
+                  payload = {"tag_name": tag, "name": release.get("name") or tag,
+                             "body": render_body(release.get("body"), assets, urls),
+                             "prerelease": str(bool(release.get("prerelease"))).lower()}
+                  if existing is None:
+                      existing = client.api("POST", "/releases", dict(payload, target_commitish=tag))
+                  endpoint = "/releases/" + quote(existing["id"])
+                  for asset in assets:
+                      uploaded = client.upload(cache.path(asset), endpoint + "/attach_files")
+                      if not isinstance(uploaded, dict) or uploaded.get("id") is None:
+                          raise MirrorError("Invalid upload response")
+                  client.api("PATCH", endpoint, payload)
+
+          def get_release(client, tag):
+              path = "/releases/" if client.platform == "GitLab" else "/releases/tags/"
+              return client.api("GET", path + quote(tag), missing=True)
+
+          def valid_token(token):
+              return bool(token) and not any(ord(c) < 33 or ord(c) == 127 for c in token)
+
+          def deletion_is_current(github, source):
+              current = github.api("GET", "/releases/" + quote(source["id"]), missing=True)
+              if current is not None and (not current.get("draft") or current["tag_name"] != source["tag_name"]):
+                  return False
+              current = get_release(github, source["tag_name"])
+              return current is None or (current.get("draft") and current["id"] == source["id"])
+
+          def delete_source_tag(github, source):
+              if not deletion_is_current(github, source):
+                  return False
+              tag = quote(source["tag_name"])
+              reference = github.api("GET", "/git/ref/tags/" + tag, missing=True)
+              if reference is not None:
+                  if not deletion_is_current(github, source):
+                      return False
+                  github.api("DELETE", "/git/refs/tags/" + tag, missing=True)
+              return True
+
+          def sync(github, targets, repo, event_name, event, confirmation):
+              rebuild = event_name == "workflow_dispatch"
+              if rebuild and confirmation != "REBUILD":
+                  raise MirrorError("REBUILD confirmation required")
+              if not rebuild and event_name != "release":
+                  raise MirrorError("Unsupported event")
+              deleting = not rebuild and event.get("action") in ("deleted", "unpublished")
+              if rebuild:
+                  releases = snapshot(github)
+                  source = None
+              else:
+                  source = event["release"]
+                  if source.get("draft") and not deleting:
+                      return
+                  if deleting:
+                      releases = []
+                  else:
+                      source = github.api("GET", "/releases/" + quote(source["id"]))
+                      if source.get("draft"):
+                          return
+                      if source["tag_name"] != event["release"]["tag_name"]:
+                          raise MirrorError("Event tag changed")
+                      source["assets"] = github.pages("/releases/{}/assets".format(quote(source["id"])))
+                      releases = [source]
+                      validate_releases(releases)
+              if deleting:
+                  if not delete_source_tag(github, source):
+                      print("Stale deletion event skipped")
+                      return
+              else:
+                  for release in releases:
+                      urls = {a["name"]: a["browser_download_url"] for a in release["assets"]}
+                      body = render_body(release.get("body"), release["assets"], urls)
+                      if body != (release.get("body") or ""):
+                          github.api("PATCH", "/releases/" + quote(release["id"]), {"body": body})
+              with tempfile.TemporaryDirectory(prefix="release-mirror-") as temporary:
+                  directory = pathlib.Path(temporary)
+                  cache = AssetCache(github, directory)
+                  for release in releases:
+                      for asset in release["assets"]:
+                          cache.path(asset)
+                  bare, askpass = prepare_git(directory, releases, repo, github.token, rebuild)
+                  if deleting:
+                      git(["check-ref-format", "refs/tags/" + source["tag_name"]], bare,
+                          "x-access-token", github.token, askpass)
+                  failures = []
+                  def attempt(platform, operation):
+                      try:
+                          operation()
+                          print(platform + " completed")
+                          return True
+                      except Exception:
+                          failures.append(platform)
+                          print(platform + " failed; details suppressed")
+                          return False
+                  for client, username in sorted(targets, key=lambda target: {"Gitee": 0, "GitLab": 1}[target[0].platform]):
+                      def process():
+                          if not valid_token(client.token):
+                              raise MirrorError("Missing credentials")
+                          if rebuild:
+                              current = client.pages("/releases")
+                              plan = plan_cleanup(client, current, rebuild=True)
+                              refs = target_tags(client, bare, askpass, username)
+                              clean(client, plan, remove_releases=True)
+                              push_refs(client, bare, askpass, username, [":" + ref for ref in refs])
+                              local = git(["for-each-ref", "--format=%(refname)", "refs/tags/"],
+                                          bare, "x-access-token", github.token, askpass)
+                              if local.strip():
+                                  push_refs(client, bare, askpass, username, ["+refs/tags/*:refs/tags/*"])
+                              for release in releases:
+                                  mirror(client, release, cache, None)
+                          else:
+                              tag = source["tag_name"]
+                              existing = get_release(client, tag)
+                              plan = plan_cleanup(client, [existing] if existing else [], source=source)
+                              clean(client, plan, remove_releases=deleting)
+                              ref = "refs/tags/" + tag
+                              if deleting:
+                                  refs = target_tags(client, bare, askpass, username)
+                                  if ref in refs:
+                                      push_refs(client, bare, askpass, username, [":" + ref])
+                              else:
+                                  push_refs(client, bare, askpass, username, ["+" + ref + ":" + ref])
+                                  mirror(client, source, cache, existing)
+                      if not attempt(client.platform, process) and rebuild:
+                          break
+                  if failures:
+                      raise MirrorError("One or more platforms failed")
 
           def run():
               repo = os.environ.get("GH_REPO", "")
               if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
-                  raise MirrorError("Invalid GitHub repository")
-              tokens = [os.environ.get(key, "") for key in ("GH_TOKEN", "GITLAB_TOKEN", "GITEE_TOKEN")]
-              if any(not token or any(ord(c) < 33 or ord(c) == 127 for c in token) for token in tokens):
-                  raise MirrorError("Missing or invalid mirror credentials")
-              github, gitlab, gitee = [Client(platform, token, repo) for platform, token in zip(
-                  ("GitHub", "GitLab", "Gitee"), tokens)]
-              force_verify = os.environ.get("FORCE_VERIFY", "false").lower()
-              if force_verify not in ("true", "false"):
-                  raise MirrorError("Invalid force_verify boolean")
-              ledger = VerificationLedger(github)
-              try:
-                  sync(github, gitlab, gitee, repo, tokens, ledger, force_verify == "true")
-              finally:
-                  ledger.save()
-
-          def sync(github, gitlab, gitee, repo, tokens, ledger, force_verify):
-              releases = snapshot(github)
-              with tempfile.TemporaryDirectory(prefix="release-mirror-") as temporary:
-                  directory = pathlib.Path(temporary)
-                  cache = AssetCache(github, directory, ledger, force_verify)
-                  targets = ((gitee, "gitsethub", plan_gitee, mirror_gitee),
-                             (gitlab, "oauth2", plan_gitlab, mirror_gitlab))
-                  plans = {}
-                  failures = 0
-                  for client, username, prepare, mirror in targets:
-                      try:
-                          plans[client.platform] = [prepare(client, release, cache) for release in releases]
-                      except Exception as error:
-                          failures += 1
-                          print(client.platform + " preflight failed: " + (str(error) if isinstance(error, MirrorError) else type(error).__name__))
-                  if not plans:
-                      raise MirrorError("All mirror preflights failed; no writes performed")
-                  bare, askpass = prepare_git(directory, releases, repo, tokens[0])
-                  tags = tag_snapshot(bare, "x-access-token", tokens[0], askpass)
-                  remote = "https://github.com/" + repo + ".git"
-                  def verify():
-                      verify_source(github, releases, tags, bare, tokens[0], askpass, remote)
-                  verify()
-                  for release in releases:
-                      urls = {asset["name"]: asset["browser_download_url"] for asset in release["assets"]}
-                      body = render_body(release.get("body"), release["assets"], urls)
-                      if body != (release.get("body") or ""):
-                          github.api("PATCH", "/releases/" + quote(release["id"]), {"body": body})
-                      release["body"] = body
-                  print("GitHub download lists aligned: " + str(len(releases)))
-                  for client, username, prepare, mirror in targets:
-                      if client.platform not in plans:
-                          continue
-                      try:
-                          push_tags(client, bare, username, askpass, tags)
-                          for release, plan in zip(releases, plans[client.platform]):
-                              mirror(client, release, cache, plan)
-                          verify()
-                          prune(client, {release["tag_name"] for release in releases}, verify)
-                          verify()
-                          push_tags(client, bare, username, askpass, tags, prune=True)
-                          if client.platform == "GitLab":
-                              prune_gitlab_packages(client, releases, cache, verify)
-                          print(client.platform + " releases aligned: " + str(len(releases)))
-                      except Exception as error:
-                          failures += 1
-                          print(client.platform + " mirror failed: " + (str(error) if isinstance(error, MirrorError) else type(error).__name__))
-                  if failures:
-                      raise MirrorError("One or more mirrors failed; rerun required")
+                  raise MirrorError("Invalid repository")
+              token = os.environ.get("GH_TOKEN", "")
+              if not valid_token(token):
+                  raise MirrorError("Missing GitHub credentials")
+              event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+              confirmation = os.environ.get("CONFIRMATION", "")
+              if event_name == "workflow_dispatch" and confirmation != "REBUILD":
+                  raise MirrorError("REBUILD confirmation required")
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as stream:
+                  event = json.load(stream)
+              github = Client("GitHub", token, repo)
+              targets = [(Client("Gitee", os.environ.get("GITEE_TOKEN", "")), "gitsethub"),
+                         (Client("GitLab", os.environ.get("GITLAB_TOKEN", "")), "oauth2")]
+              sync(github, targets, repo, event_name, event, confirmation)
 
           if __name__ == "__main__":
               try:
                   run()
-              except Exception as error:
-                  print("Release mirror failed: " + (str(error) if isinstance(error, MirrorError) else type(error).__name__))
+              except Exception:
+                  print("Release mirror failed; details suppressed")
                   raise SystemExit(1)
           PY
