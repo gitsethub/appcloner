@@ -429,39 +429,14 @@ jobs:
                       headers.update({"Content-Type": "application/octet-stream", "Content-Length": str(path.stat().st_size)})
                       method = "PUT"
                   else:
-                      boundary = uuid.uuid4().hex
-                      filename = path.name.replace('"', "%22")
-                      prefix = (
-                          "--" + boundary + '\r\nContent-Disposition: form-data; name="access_token"\r\n\r\n'
-                          + self.token + "\r\n--" + boundary
-                          + '\r\nContent-Disposition: form-data; name="file"; filename="'
-                          + filename + '"\r\nContent-Type: application/octet-stream\r\n\r\n'
-                      ).encode()
-                      suffix = ("\r\n--" + boundary + "--\r\n").encode()
-                      def multipart():
-                          yield prefix
-                          yield from chunks(path)
-                          yield suffix
-                      headers = {
-                          "User-Agent": "release-mirror",
-                          "Content-Type": "multipart/form-data; boundary=" + boundary,
-                          "Content-Length": str(len(prefix) + path.stat().st_size + len(suffix)),
-                      }
+                      headers = {"User-Agent": "release-mirror"}
                       method = "POST"
                   with tempfile.TemporaryDirectory(prefix="release-upload-") as temporary:
                       directory = pathlib.Path(temporary)
-                      body = path
                       if self.platform != "GitLab":
-                          body = directory / "request"
-                          reported = time.monotonic()
-                          with body.open("wb") as stream:
-                              for block in multipart():
-                                  stream.write(block)
-                                  now = time.monotonic()
-                                  if now - reported >= 15:
-                                      progress(self.platform, "upload preparation file={} size={} prepared={} elapsed={:.0f}s".format(
-                                          label, size, stream.tell(), now - started))
-                                      reported = now
+                          token = directory / "token"
+                          with os.fdopen(os.open(token, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as stream:
+                              stream.write(self.token.encode())
                       progress(self.platform, "upload preparation completed file={} size={} elapsed={:.0f}s".format(
                           label, size, time.monotonic() - started))
                       output = directory / "response"
@@ -469,9 +444,12 @@ jobs:
                                 "request = " + json.dumps(method)]
                       config.extend("header = " + json.dumps(key + ": " + value, ensure_ascii=False)
                                     for key, value in headers.items())
-                      option = "upload-file" if method == "PUT" else "data-binary"
-                      value = str(body) if method == "PUT" else "@" + str(body)
-                      config.append(option + " = " + json.dumps(value, ensure_ascii=False))
+                      if method == "PUT":
+                          config.append("upload-file = " + json.dumps(str(path), ensure_ascii=False))
+                      else:
+                          for field, source in (("access_token=<", token), ("file=@", path)):
+                              value = field + '"' + str(source).replace("\\", "\\\\").replace('"', '\\"') + '"'
+                              config.append("form = " + json.dumps(value, ensure_ascii=False))
                       process = None
                       timed_out = False
                       status, uploaded, speed, duration = "000", "unavailable", "unavailable", "unavailable"
