@@ -1,4 +1,4 @@
-name: Sync releases
+name: Sync GitLab releases
 
 on:
   release:
