@@ -3,6 +3,11 @@ name: Sync releases
 on:
   release:
   workflow_dispatch:
+    inputs:
+      force_verify:
+        description: 强制重新下载并校验所有附件
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -23,9 +28,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GITLAB_TOKEN: ${{ secrets.GITLAB_RELEASE_TOKEN }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          FORCE_VERIFY: ${{ inputs.force_verify == true && 'true' || 'false' }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import base64
           import hashlib
           import json
           import os
@@ -334,10 +341,110 @@ jobs:
               match = re.fullmatch(pattern, value) if isinstance(value, str) else None
               return match[1].lower() if match else None
 
+          class VerificationLedger:
+              branch = "release-sync-state"
+              path = "/contents/release-sync-state.json"
+
+              def __init__(self, github):
+                  self.github = github
+                  self.sha = None
+                  self.branch_exists = False
+                  self.data = {"version": 1, "repository": github.base, "sources": {}, "targets": {}}
+                  response = github.api("GET", self.path + "?ref=" + quote(self.branch), missing=True)
+                  if response is not None:
+                      try:
+                          data = json.loads(base64.b64decode(response["content"], validate=False))
+                          if (response.get("encoding") != "base64" or not response.get("sha")
+                                  or data.get("version") != 1 or data.get("repository") != github.base
+                                  or not isinstance(data.get("sources"), dict)
+                                  or not isinstance(data.get("targets"), dict)):
+                              raise ValueError()
+                      except (ValueError, TypeError, KeyError, AttributeError):
+                          raise MirrorError("Invalid verification ledger; refusing to overwrite") from None
+                      self.data = data
+                      self.sha = response["sha"]
+                      self.branch_exists = True
+                  else:
+                      self.branch_exists = github.api(
+                          "GET", "/git/ref/heads/" + self.branch, missing=True) is not None
+                  self.original = self.serialized()
+
+              def serialized(self):
+                  return json.dumps(self.data, sort_keys=True, separators=(",", ":"))
+
+              def source_fingerprint(self, asset):
+                  if (type(asset.get("id")) is not int or asset["id"] <= 0
+                          or not isinstance(asset.get("updated_at"), str) or not asset["updated_at"]):
+                      return None
+                  return {field: asset.get(field) for field in ("id", "name", "size", "updated_at", "digest")}
+
+              def source_digest(self, asset):
+                  fingerprint = self.source_fingerprint(asset)
+                  record = self.data["sources"].get(str(asset["id"]))
+                  if fingerprint and isinstance(record, dict) and record.get("source") == fingerprint:
+                      return sha256(record.get("sha256"))
+                  return None
+
+              def remember_source(self, asset, digest):
+                  fingerprint = self.source_fingerprint(asset)
+                  if fingerprint:
+                      self.data["sources"][str(asset["id"])] = {"source": fingerprint, "sha256": digest}
+
+              def target_key(self, client, asset):
+                  return json.dumps([client.platform, client.base, asset["id"]], separators=(",", ":"))
+
+              def target_fingerprint(self, item, url):
+                  if (not isinstance(item, dict) or type(item.get("id")) is not int or item["id"] <= 0
+                          or type(item.get("size")) is not int or item["size"] < 0):
+                      return None
+                  fields = ("id", "size", "created_at", "updated_at", "uploaded_at", "package_id",
+                            "package_created_at", "package_updated_at", "url", "download_url",
+                            "browser_download_url", "sha256", "digest", "file_sha256")
+                  return {"url": url, "metadata": {field: item[field] for field in fields if field in item}}
+
+              def reusable(self, client, url, asset, item, digest):
+                  source = self.source_fingerprint(asset)
+                  target = self.target_fingerprint(item, url)
+                  record = self.data["targets"].get(self.target_key(client, asset))
+                  return bool(source and target and isinstance(record, dict)
+                              and record.get("source") == source and record.get("target") == target
+                              and sha256(record.get("sha256")) == digest)
+
+              def forget_target(self, client, asset):
+                  self.data["targets"].pop(self.target_key(client, asset), None)
+
+              def remember_target(self, client, url, asset, item, digest):
+                  source = self.source_fingerprint(asset)
+                  target = self.target_fingerprint(item, url)
+                  if source and target and item["size"] == asset["size"]:
+                      self.data["targets"][self.target_key(client, asset)] = {
+                          "source": source, "target": target, "sha256": digest}
+                      self.remember_source(asset, digest)
+
+              def save(self):
+                  content = self.serialized()
+                  if content == self.original:
+                      return
+                  if not self.branch_exists:
+                      repository = self.github.api("GET", "")
+                      reference = self.github.api("GET", "/git/ref/heads/" + quote(repository["default_branch"]))
+                      self.github.api("POST", "/git/refs", {
+                          "ref": "refs/heads/" + self.branch, "sha": reference["object"]["sha"]})
+                      self.branch_exists = True
+                  payload = {"message": "Update release verification ledger", "branch": self.branch,
+                             "content": base64.b64encode((content + "\n").encode()).decode()}
+                  if self.sha is not None:
+                      payload["sha"] = self.sha
+                  response = self.github.api("PUT", self.path, payload)
+                  self.sha = response["content"]["sha"]
+                  self.original = content
+
           class AssetCache:
-              def __init__(self, github, directory):
+              def __init__(self, github, directory, ledger=None, force_verify=False):
                   self.github = github
                   self.directory = directory
+                  self.ledger = ledger
+                  self.force_verify = force_verify
                   self.paths = {}
                   self.digests = {}
 
@@ -357,14 +464,46 @@ jobs:
                           raise MirrorError("GitHub asset digest mismatch")
                       self.paths[key] = path
                       self.digests[key] = digest
+                      if self.ledger:
+                          self.ledger.remember_source(asset, digest)
                   return self.paths[key]
 
               def digest(self, asset):
+                  if self.force_verify:
+                      self.path(asset)
+                      return self.digests[asset["id"]]
                   expected = sha256(asset.get("digest"), prefixed=True)
                   if expected:
                       return expected
+                  if self.ledger:
+                      expected = self.ledger.source_digest(asset)
+                      if expected:
+                          return expected
                   self.path(asset)
                   return self.digests[asset["id"]]
+
+              def verified(self, client, url, asset, item, target_digest=None, missing=True):
+                  digest = self.digest(asset)
+                  if (not self.force_verify and self.ledger
+                          and self.ledger.reusable(client, url, asset, item, digest)):
+                      return True
+                  if self.ledger:
+                      self.ledger.forget_target(client, asset)
+                  if item and type(item.get("size")) is int and item["size"] != asset["size"]:
+                      return False
+                  matches = (target_digest == digest if target_digest and not self.force_verify else
+                             self.matches(client, url, asset, missing=missing))
+                  if matches and self.ledger:
+                      self.ledger.remember_target(client, url, asset, item, digest)
+                  return matches
+
+              def remember_upload(self, client, url, asset, item):
+                  if self.ledger:
+                      self.ledger.forget_target(client, asset)
+                  if not self.matches(client, url, asset):
+                      raise MirrorError(client.platform + " uploaded content mismatch")
+                  if self.ledger:
+                      self.ledger.remember_target(client, url, asset, item, self.digest(asset))
 
               def matches(self, client, url, asset, missing=False):
                   expected = self.digest(asset)
@@ -381,7 +520,7 @@ jobs:
           def package_version(asset, digest):
               return "asset-{}-{}".format(asset["id"], digest)
 
-          def gitlab_file_digest(client, version, asset):
+          def gitlab_file(client, version, asset):
               packages = client.pages("/packages?" + urllib.parse.urlencode({
                   "package_type": "generic", "package_name": "release-mirror", "package_version": version}))
               files = []
@@ -391,11 +530,18 @@ jobs:
                       if (type(package.get("id")) is not int or package["id"] <= 0
                               or package.get("status", "default") != "default"):
                           return None
-                      files.extend(item for item in client.pages("/packages/" + quote(package["id"]) + "/package_files")
+                      files.extend(dict(item, package_id=package["id"],
+                                        package_created_at=package.get("created_at"),
+                                        package_updated_at=package.get("updated_at"))
+                                   for item in client.pages("/packages/" + quote(package["id"]) + "/package_files")
                                    if item.get("file_name") == asset["name"])
               if len(files) != 1:
                   return None
-              return sha256(files[0].get("file_sha256"))
+              return files[0]
+
+          def gitlab_file_digest(client, version, asset):
+              item = gitlab_file(client, version, asset)
+              return sha256(item.get("file_sha256")) if item else None
 
           def plan_gitlab(client, release, cache):
               tag = release["tag_name"]
@@ -409,9 +555,9 @@ jobs:
                   package = "/packages/generic/release-mirror/{}/{}".format(
                       version, quote(asset["name"]))
                   url = client.base + package
-                  target_digest = gitlab_file_digest(client, version, asset)
-                  matches = (target_digest == digest if target_digest else
-                             cache.matches(client, url, asset, missing=True))
+                  item = gitlab_file(client, version, asset)
+                  target_digest = sha256(item.get("file_sha256")) if item else None
+                  matches = cache.verified(client, url, asset, item, target_digest)
                   if matches is False:
                       raise MirrorError("GitLab immutable package content mismatch")
                   if matches is None:
@@ -426,8 +572,8 @@ jobs:
               endpoint = "/releases/" + quote(tag)
               for asset, package, url in uploads:
                   client.upload(cache.path(asset), package)
-                  if not cache.matches(client, url, asset):
-                      raise MirrorError("GitLab uploaded package content mismatch")
+                  item = gitlab_file(client, package_version(asset, cache.digest(asset)), asset)
+                  cache.remember_upload(client, url, asset, item)
               payload = {"name": release.get("name") or tag,
                          "description": render_body(release.get("body"), release["assets"], urls),
                          "released_at": release["published_at"]}
@@ -466,11 +612,12 @@ jobs:
                   if name in wanted and counts[name] == 1:
                       asset = wanted[name]
                       digest = sha256(item.get("sha256")) or sha256(item.get("digest"), prefixed=True)
-                      if (digest == cache.digest(asset) if digest else
-                              cache.matches(client, urls[name], asset, missing=True)):
+                      if cache.verified(client, urls[name], asset, item, digest):
                           kept.add(name)
               for name, asset in wanted.items():
                   if name not in kept:
+                      if cache.ledger:
+                          cache.ledger.forget_target(client, asset)
                       cache.path(asset)
               return existing, urls, current, kept
 
@@ -493,8 +640,10 @@ jobs:
                       uploaded = client.upload(cache.path(asset), attachments)
                       if not isinstance(uploaded, dict) or uploaded.get("id") is None:
                           raise MirrorError("Gitee upload response missing attachment ID")
-                      if not cache.matches(client, urls[name], asset):
-                          raise MirrorError("Gitee uploaded attachment content mismatch")
+                      items = client.pages(attachments)
+                      matching = [item for item in items if item.get("name") == name]
+                      item = matching[0] if len(matching) == 1 and matching[0].get("id") == uploaded["id"] else None
+                      cache.remember_upload(client, urls[name], asset, item)
               client.api("PATCH", endpoint, payload)
 
           def prune(client, tags, verify):
@@ -575,10 +724,20 @@ jobs:
                   raise MirrorError("Missing or invalid mirror credentials")
               github, gitlab, gitee = [Client(platform, token, repo) for platform, token in zip(
                   ("GitHub", "GitLab", "Gitee"), tokens)]
+              force_verify = os.environ.get("FORCE_VERIFY", "false").lower()
+              if force_verify not in ("true", "false"):
+                  raise MirrorError("Invalid force_verify boolean")
+              ledger = VerificationLedger(github)
+              try:
+                  sync(github, gitlab, gitee, repo, tokens, ledger, force_verify == "true")
+              finally:
+                  ledger.save()
+
+          def sync(github, gitlab, gitee, repo, tokens, ledger, force_verify):
               releases = snapshot(github)
               with tempfile.TemporaryDirectory(prefix="release-mirror-") as temporary:
                   directory = pathlib.Path(temporary)
-                  cache = AssetCache(github, directory)
+                  cache = AssetCache(github, directory, ledger, force_verify)
                   targets = ((gitee, "gitsethub", plan_gitee, mirror_gitee),
                              (gitlab, "oauth2", plan_gitlab, mirror_gitlab))
                   plans = {}
