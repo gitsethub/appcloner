@@ -215,11 +215,15 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import http.client
           import json
           import os
           import pathlib
           import re
           import selectors
+          import signal
+          import socket
+          import ssl
           import subprocess
           import tempfile
           import time
@@ -237,6 +241,25 @@ jobs:
 
           class MirrorError(Exception):
               pass
+
+          def error_detail(error):
+              return str(error) if isinstance(error, MirrorError) else "category=unexpected"
+
+          def api_deadline(signum, frame):
+              raise MirrorError("category=deadline total_limit=90s")
+
+          def diagnostic_path(url, token):
+              path = urllib.parse.urlsplit(url).path
+              tokens = {token, *(os.environ.get(key, "") for key in ("GH_TOKEN", "GITEE_TOKEN", "GITLAB_TOKEN"))}
+              for secret in sorted(tokens, key=len, reverse=True):
+                  if secret:
+                      variants = {secret}
+                      for unused in range(3):
+                          variants.update(urllib.parse.quote(value, safe="") for value in tuple(variants))
+                          variants.update(urllib.parse.quote_plus(value, safe="") for value in tuple(variants))
+                      for value in sorted(variants, key=len, reverse=True):
+                          path = re.sub(re.escape(value), "[redacted]", path, flags=re.IGNORECASE)
+              return json.dumps(path, ensure_ascii=True)
 
           def progress(platform, stage, current=None, total=None):
               suffix = "" if current is None else " {}/{}".format(current, total)
@@ -307,20 +330,44 @@ jobs:
               def open(self, method, url, data=None, headers=None, missing=False):
                   checked_url(url)
                   request = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-                  for attempt in range(3):
+                  readonly = method in ("GET", "HEAD")
+                  attempts = 3 if readonly else 1
+                  started = time.monotonic()
+                  deadline = started + (90 if readonly else 180)
+                  for attempt in range(1, attempts + 1):
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0:
+                          raise MirrorError("category=deadline total_limit=90s")
+                      status, delay = "none", 2 ** (attempt - 1)
                       try:
-                          return self.opener.open(request, timeout=180)
+                          with self.opener.open(request, timeout=min(30 if readonly else 180, remaining)) as response:
+                              return response.read()
                       except urllib.error.HTTPError as error:
                           status = error.code
+                          retry_after = error.headers.get("Retry-After", "") if error.headers else ""
                           error.close()
                           if missing and status == 404:
                               return None
-                          if method in ("GET", "HEAD") and status in (429, 500, 502, 503, 504) and attempt < 2:
-                              time.sleep(2 ** attempt)
-                              continue
-                          raise MirrorError("HTTP request failed") from None
-                      except (urllib.error.URLError, OSError, TimeoutError):
-                          raise MirrorError("Network request failed") from None
+                          category, retryable = "http", status == 429 or 500 <= status <= 599
+                          if re.fullmatch(r"[0-9]{1,6}", retry_after):
+                              delay = min(int(retry_after), 10)
+                      except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+                          reason = error.reason if isinstance(error, urllib.error.URLError) else error
+                          category = ("timeout" if isinstance(reason, TimeoutError) else
+                                      "tls" if isinstance(reason, ssl.SSLError) else
+                                      "dns" if isinstance(reason, socket.gaierror) else
+                                      "response-read" if isinstance(reason, http.client.HTTPException) else "network")
+                          retryable = not isinstance(reason, ssl.SSLError) and (
+                              not isinstance(reason, socket.gaierror) or reason.errno == socket.EAI_AGAIN)
+                      detail = "attempt={}/{} HTTP={} category={} elapsed={:.1f}s".format(
+                          attempt, attempts, status, category, time.monotonic() - started)
+                      if not readonly or not retryable or attempt == attempts:
+                          raise MirrorError(detail) from None
+                      remaining = deadline - time.monotonic()
+                      if delay >= remaining:
+                          raise MirrorError(detail + " retry_budget_exhausted") from None
+                      progress(self.platform, "API {} retry {} backoff={}s".format(method, detail, delay))
+                      time.sleep(delay)
 
               def auth(self, method, url, data=None):
                   if origin(url) != origin(self.base):
@@ -338,30 +385,37 @@ jobs:
                   return url, headers, data
 
               def api(self, method, path, data=None, missing=False):
-                  safe_path = json.dumps(urllib.parse.urlsplit(self.base + path).path, ensure_ascii=True)
-                  safe_path = safe_path.replace(self.token, "[redacted]") if self.token else safe_path
+                  safe_path = diagnostic_path(self.base + path, self.token)
                   stage = "API {} {}{}".format(method, safe_path, " DELETE requested" if method == "DELETE" else "")
                   started = time.monotonic()
                   progress(self.platform, stage + " started")
-                  url, headers, data = self.auth(method, self.base + path, data)
-                  if data is not None:
-                      if self.platform == "Gitee":
-                          data = urllib.parse.urlencode(data).encode()
-                          headers["Content-Type"] = "application/x-www-form-urlencoded"
-                      else:
-                          data = json.dumps(data).encode()
-                          headers["Content-Type"] = "application/json"
+                  readonly = method in ("GET", "HEAD")
+                  previous_handler = signal.signal(signal.SIGALRM, api_deadline) if readonly else None
                   try:
-                      response = self.open(method, url, data, headers, missing)
-                      if response is None:
+                      if readonly:
+                          signal.setitimer(signal.ITIMER_REAL, 90)
+                      url, headers, data = self.auth(method, self.base + path, data)
+                      if data is not None:
+                          if self.platform == "Gitee":
+                              data = urllib.parse.urlencode(data).encode()
+                              headers["Content-Type"] = "application/x-www-form-urlencoded"
+                          else:
+                              data = json.dumps(data).encode()
+                              headers["Content-Type"] = "application/json"
+                      raw = self.open(method, url, data, headers, missing)
+                      if raw is None:
                           progress(self.platform, stage + " completed missing elapsed={:.1f}s".format(time.monotonic() - started))
                           return None
-                      with response:
-                          raw = response.read()
                       result = json.loads(raw) if raw else None
-                  except Exception:
-                      progress(self.platform, stage + " failed elapsed={:.1f}s".format(time.monotonic() - started))
-                      raise
+                  except Exception as error:
+                      detail = "category=json" if isinstance(error, (ValueError, UnicodeError)) else error_detail(error)
+                      message = stage + " failed {} elapsed={:.1f}s".format(detail, time.monotonic() - started)
+                      progress(self.platform, message)
+                      raise MirrorError(message) from None
+                  finally:
+                      if readonly:
+                          signal.setitimer(signal.ITIMER_REAL, 0)
+                          signal.signal(signal.SIGALRM, previous_handler)
                   progress(self.platform, stage + " completed elapsed={:.1f}s".format(time.monotonic() - started))
                   return result
 
@@ -845,9 +899,10 @@ jobs:
                           operation()
                           print(platform + " completed", flush=True)
                           return True
-                      except Exception:
-                          failures.append(platform)
-                          print(platform + " failed; details suppressed", flush=True)
+                      except Exception as error:
+                          detail = platform + " failed: " + error_detail(error)
+                          failures.append(detail)
+                          print(detail, flush=True)
                           return False
                   for client, username in sorted(targets, key=lambda target: {"Gitee": 0, "GitLab": 1}[target[0].platform]):
                       def process():
@@ -891,7 +946,7 @@ jobs:
                       if not attempt(client.platform, process) and rebuild:
                           break
                   if failures:
-                      raise MirrorError("One or more platforms failed")
+                      raise MirrorError("; ".join(failures))
 
           def run():
               repo = os.environ.get("GH_REPO", "")
@@ -923,7 +978,7 @@ jobs:
           if __name__ == "__main__":
               try:
                   run()
-              except Exception:
-                  print("Release mirror failed; details suppressed", flush=True)
-                  raise SystemExit(1)
+              except Exception as error:
+                  print("Release mirror failed: " + error_detail(error), flush=True)
+                  raise SystemExit(1) from None
           PY
