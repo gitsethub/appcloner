@@ -1,5 +1,5 @@
 # 将 GitHub main 同步到 GitLab main、Gitee main 和 Gitee master
-name: Sync 2main+1master
+name: Sync 2main 1master
 
 # main 收到提交时自动执行，也支持手动运行
 on:
