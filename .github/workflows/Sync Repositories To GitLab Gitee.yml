@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       overwrite:
-        description: "已备份，允许覆盖 GitLab/Gitee 同名分支及标签历史"
+        description: "已备份，允许覆盖 GitLab/Gitee 同名分支及标签历史，仅修改简介时等待定时任务，或手动运行"
         type: boolean
         required: false
         default: false
