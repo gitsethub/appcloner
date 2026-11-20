@@ -136,7 +136,7 @@ jobs:
           main_sha=$(git rev-parse --verify refs/heads/main)
           git update-ref refs/heads/master "$main_sha"
 
-      - name: Push all branches and tags and prune deleted refs
+      - name: Push all branches and tags without deleting refs
         shell: bash
         env:
           TARGET_URL: ${{ matrix.url }}
@@ -153,7 +153,7 @@ jobs:
           if [ "$OVERWRITE" = "true" ]; then
             options+=(--force)
           fi
-          git push --prune "${options[@]}" "$TARGET_URL" \
+          git push "${options[@]}" "$TARGET_URL" \
             'refs/heads/*:refs/heads/*' \
             'refs/tags/*:refs/tags/*'
 
@@ -205,3 +205,19 @@ jobs:
               if actual != expected:
                   sys.exit(f"{target} metadata verification failed: {key}")
           print(f"{target}: description and default branch synchronized")
+
+      - name: Delete branches and tags absent from GitHub
+        shell: bash
+        env:
+          TARGET_URL: ${{ matrix.url }}
+          SYNC_USERNAME: ${{ matrix.username }}
+          SYNC_TOKEN: ${{ secrets[matrix.secret] }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          test -n "$SYNC_TOKEN" || { echo "Missing target token"; exit 1; }
+          export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          cd source.git
+          git push --prune "$TARGET_URL" \
+            'refs/heads/*:refs/heads/*' \
+            'refs/tags/*:refs/tags/*'
