@@ -104,12 +104,12 @@ jobs:
             url: https://gitlab.com/gitsethub/appcloner.git
             api: https://gitlab.com/api/v4/projects/gitsethub%2Fappcloner
             username: oauth2
-            secret: GITLAB_TOKEN
+            secret: GITLAB_TOKEN_HAVE_ALL_PERMISSIONS
           - target: Gitee
             url: https://gitee.com/gitsethub/appcloner.git
             api: https://gitee.com/api/v5/repos/gitsethub/appcloner
             username: gitsethub
-            secret: GITEE_TOKEN
+            secret: GITEE_TOKEN_HAVE_ALL_PERMISSIONS
 
     steps:
       - name: Fetch all GitHub branches and tags
