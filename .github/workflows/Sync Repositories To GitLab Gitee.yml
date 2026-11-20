@@ -8,11 +8,13 @@ on:
     - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
-      overwrite:
-        description: "允许覆盖 GitLab/Gitee 同名分支及标签历史，仅修改 GitHub 简介、默认分支时等待定时任务，或手动运行"
-        type: boolean
+      sync_notice:
+        description: "仅修改 GitHub 简介、默认分支时需等待定时任务，或手动运行"
+        type: choice
         required: false
-        default: false
+        default: "立即同步（始终以 GitHub 为准）"
+        options:
+          - "立即同步（始终以 GitHub 为准）"
 
 permissions:
   contents: read
@@ -60,7 +62,7 @@ jobs:
               exit 0
             fi
           fi
-          git push --force-with-lease="refs/heads/master:$old_master" \
+          git push --force \
             origin refs/heads/main:refs/heads/master
 
       - name: Read GitHub description and default branch
@@ -142,18 +144,13 @@ jobs:
           TARGET_URL: ${{ matrix.url }}
           SYNC_USERNAME: ${{ matrix.username }}
           SYNC_TOKEN: ${{ secrets[matrix.secret] }}
-          OVERWRITE: ${{ inputs.overwrite }}
           GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
           test -n "$SYNC_TOKEN" || { echo "Missing target token"; exit 1; }
           export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
           cd source.git
-          options=()
-          if [ "$OVERWRITE" = "true" ]; then
-            options+=(--force)
-          fi
-          git push "${options[@]}" "$TARGET_URL" \
+          git push --force "$TARGET_URL" \
             'refs/heads/*:refs/heads/*' \
             'refs/tags/*:refs/tags/*'
 
@@ -218,6 +215,6 @@ jobs:
           test -n "$SYNC_TOKEN" || { echo "Missing target token"; exit 1; }
           export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
           cd source.git
-          git push --prune "$TARGET_URL" \
+          git push --force --prune "$TARGET_URL" \
             'refs/heads/*:refs/heads/*' \
             'refs/tags/*:refs/tags/*'
