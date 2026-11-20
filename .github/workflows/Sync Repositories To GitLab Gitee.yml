@@ -136,7 +136,7 @@ jobs:
           main_sha=$(git rev-parse --verify refs/heads/main)
           git update-ref refs/heads/master "$main_sha"
 
-      - name: Push all branches and tags
+      - name: Push all branches and tags and prune deleted refs
         shell: bash
         env:
           TARGET_URL: ${{ matrix.url }}
@@ -153,7 +153,7 @@ jobs:
           if [ "$OVERWRITE" = "true" ]; then
             options+=(--force)
           fi
-          git push "${options[@]}" "$TARGET_URL" \
+          git push --prune "${options[@]}" "$TARGET_URL" \
             'refs/heads/*:refs/heads/*' \
             'refs/tags/*:refs/tags/*'
 
