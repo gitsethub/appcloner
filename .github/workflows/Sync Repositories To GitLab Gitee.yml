@@ -4,8 +4,6 @@ on:
   push:
   create:
   delete:
-  schedule:
-    - cron: "23 */6 * * *"
   workflow_dispatch:
     inputs:
       sync_notice:
