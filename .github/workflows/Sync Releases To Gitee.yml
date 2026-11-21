@@ -582,6 +582,7 @@ jobs:
                   print(f"Gitee stale attachment removed: {nm}")
           # 最后回写 Release（标题/正文/预发布标记），保证最终与 GitHub 一致。
           gee_api("PATCH", f"{base}/releases/{rid}", {"name": name, "body": body or name,
+                  "tag_name": tag,
                   "prerelease": str(release.get("prerelease", False)).lower()})
           # 此脚本不会同步下载次数。
           print(f"Gitee: release sync completed: {tag}")
