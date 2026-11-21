@@ -148,9 +148,9 @@ jobs:
           test -n "$SYNC_TOKEN" || { echo "Missing target token"; exit 1; }
           export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
           cd source.git
+          # Tag 由 Sync Releases To GitLab 工作流专职同步，这里只同步分支，避免与该工作流重复推送 Tag。
           git push --force "$TARGET_URL" \
-            'refs/heads/*:refs/heads/*' \
-            'refs/tags/*:refs/tags/*'
+            'refs/heads/*:refs/heads/*'
 
       - name: Sync description and default branch
         shell: python
@@ -213,6 +213,6 @@ jobs:
           test -n "$SYNC_TOKEN" || { echo "Missing target token"; exit 1; }
           export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
           cd source.git
+          # Tag 由 Sync Releases To GitLab 工作流专职同步，这里只修剪目标端多余的分支。
           git push --force --prune "$TARGET_URL" \
-            'refs/heads/*:refs/heads/*' \
-            'refs/tags/*:refs/tags/*'
+            'refs/heads/*:refs/heads/*'
