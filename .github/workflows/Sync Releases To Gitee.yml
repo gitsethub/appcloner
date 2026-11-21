@@ -113,131 +113,117 @@ jobs:
             # 先 clone 仓库，用于判断 GitHub tag 是否仍在，以及删除 Gitee 上的 tag。
             git clone --bare "https://github.com/$GH_REPO.git" source.git
             # Python 先回查 GitHub 防止陈旧事件误删，再删除 Gitee 对应内容。
-          DELETING=1 python3 - <<'PY'
-          import json, os, time, urllib.error, urllib.parse, urllib.request
+            DELETING=1 python3 - <<'PY'
+            import json, os, time, urllib.error, urllib.parse, urllib.request
 
-          tag = os.environ["RELEASE_TAG"]
-          token = os.environ["GITEE_TOKEN"]
-          base = "https://gitee.com/api/v5/repos/gitsethub/appcloner"
-          release_id = os.environ.get("RELEASE_ID") or ""
-          quote = lambda value: urllib.parse.quote(str(value), safe="")
+            tag = os.environ["RELEASE_TAG"]
+            token = os.environ["GITEE_TOKEN"]
+            base = "https://gitee.com/api/v5/repos/gitsethub/appcloner"
+            release_id = os.environ.get("RELEASE_ID") or ""
+            quote = lambda value: urllib.parse.quote(str(value), safe="")
 
-          # 脱敏：错误信息中出现的令牌一律替换为 [redacted]，避免泄露到 Actions 日志。
-          def redact(text):
-              for secret in (os.environ.get("GITEE_TOKEN", ""), os.environ.get("GH_TOKEN", "")):
-                  if secret:
-                      text = text.replace(secret, "[redacted]")
-              return text
+            # 脱敏：错误信息中出现的令牌一律替换为 [redacted]，避免泄露到 Actions 日志。
+            def redact(text):
+                for secret in (os.environ.get("GITEE_TOKEN", ""), os.environ.get("GH_TOKEN", "")):
+                    if secret:
+                        text = text.replace(secret, "[redacted]")
+                return text
 
-          # 通用接口请求：Gitee 用 access_token 认证（GET 走查询参数，其他走表单）。
-          # missing=True 时仅把 HTTP 404 当作不存在；GET 对 429/5xx/网络抖动自动重试退避，其他错误直接停止。
-          def gee_api(method, url, data=None, missing=False):
-              fields = dict(data or {})
-              fields["access_token"] = token
-              if method == "GET":
-                  sep = "&" if "?" in url else "?"
-                  url = url + sep + urllib.parse.urlencode(fields)
-                  payload = None
-                  headers = {"User-Agent": "AppCloner-release-sync"}
-                  request = urllib.request.Request(url, data=payload, headers=headers, method=method)
-                  for attempt in range(3):
-                      try:
-                          with urllib.request.urlopen(request, timeout=120) as response:
-                              content = response.read()
-                              return json.loads(content) if content else None
-                      except urllib.error.HTTPError as error:
-                          if missing and error.code == 404:
-                              return None
-                          retryable = error.code == 429 or 500 <= error.code <= 599
-                          if not retryable or attempt == 2:
-                              detail = ""
-                              try:
-                                  detail = error.read().decode("utf-8", "replace")[:500]
-                              except Exception:
-                                  pass
-                              raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
-                      except urllib.error.URLError:
-                          if attempt == 2:
-                              raise RuntimeError("Gitee network request failed") from None
-                      time.sleep(2 ** attempt)
-              else:
-                  payload = urllib.parse.urlencode(fields).encode()
-                  headers = {"User-Agent": "AppCloner-release-sync",
-                             "Content-Type": "application/x-www-form-urlencoded"}
-                  request = urllib.request.Request(url, data=payload, headers=headers, method=method)
-                  try:
-                      with urllib.request.urlopen(request, timeout=120) as response:
-                          content = response.read()
-                          return json.loads(content) if content else None
-                  except urllib.error.HTTPError as error:
-                      if missing and error.code == 404:
-                          return None
-                      detail = ""
-                      try:
-                          detail = error.read().decode("utf-8", "replace")[:500]
-                      except Exception:
-                          pass
-                      raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
-                  except urllib.error.URLError:
-                      raise RuntimeError("Gitee network request failed") from None
+            # Gitee 认证：GET 用查询参数，其他方法用表单字段；GET 对 429/5xx/网络抖动自动重试退避。
+            def gee_api(method, url, missing=False):
+                fields = {"access_token": token}
+                if method == "GET":
+                    sep = "&" if "?" in url else "?"
+                    url = url + sep + urllib.parse.urlencode(fields)
+                    data = None
+                    headers = {"User-Agent": "AppCloner-release-sync"}
+                    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+                    for attempt in range(3):
+                        try:
+                            with urllib.request.urlopen(request, timeout=120) as response:
+                                raw = response.read()
+                                return json.loads(raw) if raw else None
+                        except urllib.error.HTTPError as error:
+                            if missing and error.code == 404:
+                                return None
+                            retryable = error.code == 429 or 500 <= error.code <= 599
+                            if not retryable or attempt == 2:
+                                raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
+                        except urllib.error.URLError:
+                            if attempt == 2:
+                                raise RuntimeError("Gitee network request failed") from None
+                        time.sleep(2 ** attempt)
+                else:
+                    data = urllib.parse.urlencode(fields).encode()
+                    headers = {"User-Agent": "AppCloner-release-sync",
+                               "Content-Type": "application/x-www-form-urlencoded"}
+                    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+                    try:
+                        with urllib.request.urlopen(request, timeout=120) as response:
+                            raw = response.read()
+                            return json.loads(raw) if raw else None
+                    except urllib.error.HTTPError as error:
+                        if missing and error.code == 404:
+                            return None
+                        raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
+                    except urllib.error.URLError:
+                        raise RuntimeError("Gitee network request failed") from None
 
-          # 上传附件到 Gitee Release：multipart 表单，令牌通过 stdin 传给 curl。
-          # 单个上传最多等待 900 秒；不自动重试，失败时可手动重跑工作流。
-          def gh_api(path, missing=False):
-              url = "https://api.github.com/repos/" + os.environ["GH_REPO"] + path
-              request = urllib.request.Request(url, headers={
-                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
-                  "Accept": "application/vnd.github+json",
-                  "X-GitHub-Api-Version": "2022-11-28",
-                  "User-Agent": "AppCloner-release-sync",
-              })
-              try:
-                  with urllib.request.urlopen(request, timeout=60) as response:
-                      raw = response.read()
-                      return json.loads(raw) if raw else None
-              except urllib.error.HTTPError as error:
-                  if missing and error.code == 404:
-                      return None
-                  raise RuntimeError(f"GitHub API failed: HTTP {error.code}") from None
+            def gh_api(path, missing=False):
+                url = "https://api.github.com/repos/" + os.environ["GH_REPO"] + path
+                request = urllib.request.Request(url, headers={
+                    "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    "User-Agent": "AppCloner-release-sync",
+                })
+                try:
+                    with urllib.request.urlopen(request, timeout=60) as response:
+                        raw = response.read()
+                        return json.loads(raw) if raw else None
+                except urllib.error.HTTPError as error:
+                    if missing and error.code == 404:
+                        return None
+                    raise RuntimeError(f"GitHub API failed: HTTP {error.code}") from None
 
-          # 陈旧事件保护：回查 GitHub，若该 release 已被重建为非草稿则跳过删除。
-          skip = False
-          if release_id:
-              current = gh_api("/releases/" + release_id, missing=True)
-              if current is not None and (not current.get("draft") or current.get("tag_name") != tag):
-                  skip = True
-          if not skip:
-              current = gh_api("/releases/tags/" + quote(tag), missing=True)
-              if current is not None and not current.get("draft"):
-                  skip = True
-          if skip:
-              print(f"Stale deletion event skipped: {tag}")
-              raise SystemExit(0)
+            # 陈旧事件保护：回查 GitHub，若该 release 已被重建为非草稿则跳过删除。
+            skip = False
+            if release_id:
+                current = gh_api("/releases/" + release_id, missing=True)
+                if current is not None and (not current.get("draft") or current.get("tag_name") != tag):
+                    skip = True
+            if not skip:
+                current = gh_api("/releases/tags/" + quote(tag), missing=True)
+                if current is not None and not current.get("draft"):
+                    skip = True
+            if skip:
+                print(f"Stale deletion event skipped: {tag}")
+                raise SystemExit(0)
 
-          # Gitee 附件直接存在 Release 下（无 Package Registry）。
-          # 删除该 tag 的 Release：先逐个删附件，再删 Release 本身。
-          existing = gee_api("GET", f"{base}/releases/tags/{quote(tag)}", missing=True)
-          if isinstance(existing, dict) and existing.get("id") is not None:
-              rid = existing["id"]
-              # 反复取第一页并删光，避免删除中分页错位导致漏删。
-              while True:
-                  batch = gee_api("GET", f"{base}/releases/{rid}/attach_files?per_page=100&page=1") or []
-                  if not isinstance(batch, list) or not batch:
-                      break
-                  for att in batch:
-                      aid = att.get("id")
-                      if aid is not None:
-                          gee_api("DELETE", f"{base}/releases/{rid}/attach_files/{aid}", missing=True)
-                          print(f"Gitee attachment deleted: {att.get('name')}")
-              gee_api("DELETE", f"{base}/releases/{rid}", missing=True)
-              print(f"Gitee release deleted: {tag}")
-          else:
-              print(f"Gitee release absent: {tag}")
+            # Gitee 附件直接存在 Release 下（无 Package Registry）。
+            # 删除该 tag 的 Release：先逐个删附件，再删 Release 本身。
+            existing = gee_api("GET", f"{base}/releases/tags/{quote(tag)}", missing=True)
+            if isinstance(existing, dict) and existing.get("id") is not None:
+                rid = existing["id"]
+                # 反复取第一页并删光，避免删除中分页错位导致漏删。
+                while True:
+                    batch = gee_api("GET", f"{base}/releases/{rid}/attach_files?per_page=100&page=1") or []
+                    if not isinstance(batch, list) or not batch:
+                        break
+                    for att in batch:
+                        aid = att.get("id")
+                        if aid is not None:
+                            gee_api("DELETE", f"{base}/releases/{rid}/attach_files/{aid}", missing=True)
+                            print(f"Gitee attachment deleted: {att.get('name')}")
+                gee_api("DELETE", f"{base}/releases/{rid}", missing=True)
+                print(f"Gitee release deleted: {tag}")
+            else:
+                print(f"Gitee release absent: {tag}")
 
-          # Gitee 没有独立的 Package 存储，附件随 Release 删除而清除，无需跨 Release 清扫。
-          # Tag 的删除在下方 Bash 中根据 GitHub tag 是否仍在决定（Gitee 用 git push 删 tag）。
-          print(f"Gitee: release deletion completed: {tag}")
-          PY
+            # Gitee 没有独立的 Package 存储，附件随 Release 删除而清除，无需跨 Release 清扫。
+            # Tag 的删除在下方 Bash 中根据 GitHub tag 是否仍在决定（Gitee 用 git push 删 tag）。
+            print(f"Gitee: release deletion completed: {tag}")
+            PY
             # 仅当 GitHub 上该 Tag 也不存在时，才删除 Gitee 的 Tag（Gitee 用 git push 删 tag）。
             if ! git -C source.git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
               git -C source.git push --force "$target_url" ":refs/tags/$RELEASE_TAG" || true
@@ -420,12 +406,7 @@ jobs:
                               return None
                           retryable = error.code == 429 or 500 <= error.code <= 599
                           if not retryable or attempt == 2:
-                              detail = ""
-                              try:
-                                  detail = error.read().decode("utf-8", "replace")[:500]
-                              except Exception:
-                                  pass
-                              raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
+                              raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
                       except urllib.error.URLError:
                           if attempt == 2:
                               raise RuntimeError("Gitee network request failed") from None
@@ -442,12 +423,7 @@ jobs:
                   except urllib.error.HTTPError as error:
                       if missing and error.code == 404:
                           return None
-                      detail = ""
-                      try:
-                          detail = error.read().decode("utf-8", "replace")[:500]
-                      except Exception:
-                          pass
-                      raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
+                      raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
                   except urllib.error.URLError:
                       raise RuntimeError("Gitee network request failed") from None
 
@@ -582,96 +558,83 @@ jobs:
                   print(f"Gitee stale attachment removed: {nm}")
           # 最后回写 Release（标题/正文/预发布标记），保证最终与 GitHub 一致。
           gee_api("PATCH", f"{base}/releases/{rid}", {"name": name, "body": body or name,
-                  "tag_name": tag,
                   "prerelease": str(release.get("prerelease", False)).lower()})
           # 此脚本不会同步下载次数。
           print(f"Gitee: release sync completed: {tag}")
           PY
           else
             # GitHub 上该 tag 没有 release：清理 Gitee 上可能残留的 release 及其附件（自愈删除运行失败的情况）。
-          python3 - <<'PY'
-          import json, os, time, urllib.error, urllib.parse, urllib.request
+            python3 - <<'PY'
+            import json, os, time, urllib.error, urllib.parse, urllib.request
 
-          tag = os.environ["RELEASE_TAG"]
-          token = os.environ["GITEE_TOKEN"]
-          base = "https://gitee.com/api/v5/repos/gitsethub/appcloner"
-          quote = lambda value: urllib.parse.quote(str(value), safe="")
+            tag = os.environ["RELEASE_TAG"]
+            token = os.environ["GITEE_TOKEN"]
+            base = "https://gitee.com/api/v5/repos/gitsethub/appcloner"
+            quote = lambda value: urllib.parse.quote(str(value), safe="")
 
-          # 脱敏：错误信息中出现的令牌一律替换为 [redacted]，避免泄露到 Actions 日志。
-          def redact(text):
-              for secret in (os.environ.get("GITEE_TOKEN", ""), os.environ.get("GH_TOKEN", "")):
-                  if secret:
-                      text = text.replace(secret, "[redacted]")
-              return text
+            # 脱敏：错误信息中出现的令牌一律替换为 [redacted]，避免泄露到 Actions 日志。
+            def redact(text):
+                for secret in (os.environ.get("GITEE_TOKEN", ""), os.environ.get("GH_TOKEN", "")):
+                    if secret:
+                        text = text.replace(secret, "[redacted]")
+                return text
 
-          # 通用接口请求：Gitee 用 access_token 认证（GET 走查询参数，其他走表单）。
-          # missing=True 时仅把 HTTP 404 当作不存在；GET 对 429/5xx/网络抖动自动重试退避，其他错误直接停止。
-          def gee_api(method, url, missing=False):
-              fields = {"access_token": token}
-              if method == "GET":
-                  sep = "&" if "?" in url else "?"
-                  url = url + sep + urllib.parse.urlencode(fields)
-                  data = None
-                  headers = {"User-Agent": "AppCloner-release-sync"}
-                  request = urllib.request.Request(url, data=data, headers=headers, method=method)
-                  for attempt in range(3):
-                      try:
-                          with urllib.request.urlopen(request, timeout=120) as response:
-                              raw = response.read()
-                              return json.loads(raw) if raw else None
-                      except urllib.error.HTTPError as error:
-                          if missing and error.code == 404:
-                              return None
-                          retryable = error.code == 429 or 500 <= error.code <= 599
-                          if not retryable or attempt == 2:
-                              detail = ""
-                              try:
-                                  detail = error.read().decode("utf-8", "replace")[:500]
-                              except Exception:
-                                  pass
-                              raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
-                      except urllib.error.URLError:
-                          if attempt == 2:
-                              raise RuntimeError("Gitee network request failed") from None
-                      time.sleep(2 ** attempt)
-              else:
-                  data = urllib.parse.urlencode(fields).encode()
-                  headers = {"User-Agent": "AppCloner-release-sync",
-                             "Content-Type": "application/x-www-form-urlencoded"}
-                  request = urllib.request.Request(url, data=data, headers=headers, method=method)
-                  try:
-                      with urllib.request.urlopen(request, timeout=120) as response:
-                          raw = response.read()
-                          return json.loads(raw) if raw else None
-                  except urllib.error.HTTPError as error:
-                      if missing and error.code == 404:
-                          return None
-                      detail = ""
-                      try:
-                          detail = error.read().decode("utf-8", "replace")[:500]
-                      except Exception:
-                          pass
-                      raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
-                  except urllib.error.URLError:
-                      raise RuntimeError("Gitee network request failed") from None
+            def gee_api(method, url, missing=False):
+                fields = {"access_token": token}
+                if method == "GET":
+                    sep = "&" if "?" in url else "?"
+                    url = url + sep + urllib.parse.urlencode(fields)
+                    data = None
+                    headers = {"User-Agent": "AppCloner-release-sync"}
+                    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+                    for attempt in range(3):
+                        try:
+                            with urllib.request.urlopen(request, timeout=120) as response:
+                                raw = response.read()
+                                return json.loads(raw) if raw else None
+                        except urllib.error.HTTPError as error:
+                            if missing and error.code == 404:
+                                return None
+                            retryable = error.code == 429 or 500 <= error.code <= 599
+                            if not retryable or attempt == 2:
+                                raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
+                        except urllib.error.URLError:
+                            if attempt == 2:
+                                raise RuntimeError("Gitee network request failed") from None
+                        time.sleep(2 ** attempt)
+                else:
+                    data = urllib.parse.urlencode(fields).encode()
+                    headers = {"User-Agent": "AppCloner-release-sync",
+                               "Content-Type": "application/x-www-form-urlencoded"}
+                    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+                    try:
+                        with urllib.request.urlopen(request, timeout=120) as response:
+                            raw = response.read()
+                            return json.loads(raw) if raw else None
+                    except urllib.error.HTTPError as error:
+                        if missing and error.code == 404:
+                            return None
+                        raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
+                    except urllib.error.URLError:
+                        raise RuntimeError("Gitee network request failed") from None
 
-          # 清理该 tag 在 Gitee 上可能残留的 release 及其附件（删除运行失败后的自愈）。
-          existing = gee_api("GET", f"{base}/releases/tags/{quote(tag)}", missing=True)
-          if isinstance(existing, dict) and existing.get("id") is not None:
-              rid = existing["id"]
-              while True:
-                  batch = gee_api("GET", f"{base}/releases/{rid}/attach_files?per_page=100&page=1") or []
-                  if not isinstance(batch, list) or not batch:
-                      break
-                  for att in batch:
-                      aid = att.get("id")
-                      if aid is not None:
-                          gee_api("DELETE", f"{base}/releases/{rid}/attach_files/{aid}", missing=True)
-                          print(f"Gitee attachment deleted: {att.get('name')}")
-              gee_api("DELETE", f"{base}/releases/{rid}", missing=True)
-              print(f"Gitee residual release cleaned: {tag}")
-          else:
-              print(f"Gitee release absent: {tag}")
-          print(f"Gitee: tag only (no release) synced: {tag}")
-          PY
+            # 清理该 tag 在 Gitee 上可能残留的 release 及其附件（删除运行失败后的自愈）。
+            existing = gee_api("GET", f"{base}/releases/tags/{quote(tag)}", missing=True)
+            if isinstance(existing, dict) and existing.get("id") is not None:
+                rid = existing["id"]
+                while True:
+                    batch = gee_api("GET", f"{base}/releases/{rid}/attach_files?per_page=100&page=1") or []
+                    if not isinstance(batch, list) or not batch:
+                        break
+                    for att in batch:
+                        aid = att.get("id")
+                        if aid is not None:
+                            gee_api("DELETE", f"{base}/releases/{rid}/attach_files/{aid}", missing=True)
+                            print(f"Gitee attachment deleted: {att.get('name')}")
+                gee_api("DELETE", f"{base}/releases/{rid}", missing=True)
+                print(f"Gitee residual release cleaned: {tag}")
+            else:
+                print(f"Gitee release absent: {tag}")
+            print(f"Gitee: tag only (no release) synced: {tag}")
+            PY
           fi
