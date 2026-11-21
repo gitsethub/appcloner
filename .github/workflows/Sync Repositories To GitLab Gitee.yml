@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       sync_notice:
-        description: "仅修改 GitHub 简介、默认分支时需等待定时任务，或手动运行"
+        description: "修改GitHub简介和默认分支，需等待下次自动或手动运行才能同步"
         type: choice
         required: false
         default: "立即同步（始终以 GitHub 为准）"
