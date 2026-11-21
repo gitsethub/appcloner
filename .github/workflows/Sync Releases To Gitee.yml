@@ -501,30 +501,6 @@ jobs:
                   page += 1
               return result
 
-          # 下载 Gitee 远端附件计算 SHA256（带 access_token 认证；异常时不泄露含令牌的 URL）。
-          def remote_sha256(url):
-              sep = "&" if "?" in url else "?"
-              full = url + sep + urllib.parse.urlencode({"access_token": token})
-              request = urllib.request.Request(full, headers={"User-Agent": "AppCloner-release-sync"})
-              sha = hashlib.sha256()
-              try:
-                  with urllib.request.urlopen(request, timeout=180) as response:
-                      while True:
-                          chunk = response.read(1024 * 1024)
-                          if not chunk:
-                              break
-                          sha.update(chunk)
-              except Exception:
-                  raise RuntimeError("Gitee remote download failed") from None
-              return sha.hexdigest()
-
-          # 本地附件的 SHA256：优先用 GitHub 提供的 digest，否则读取本地文件计算。
-          def local_sha256(asset):
-              digest = asset.get("digest")
-              if digest and digest.startswith("sha256:"):
-                  return digest.removeprefix("sha256:")
-              return hashlib.sha256((pathlib.Path("assets") / asset["name"]).read_bytes()).hexdigest()
-
           # 先确保 Gitee 上存在该 Release（上传附件需要 release id），并渲染 Gitee 正文。
           gee_urls = {a["name"]: gitee_download_url(a["name"]) for a in assets}
           body = render_body(gh_body, assets, gee_urls)
@@ -538,7 +514,8 @@ jobs:
           else:
               print(f"Gitee release exists: {tag}")
           rid = existing["id"]
-          # 比对并同步附件：同名且大小+SHA256 一致则跳过；不一致先删旧再传新。
+          # 同步附件：Gitee 不提供附件 SHA256 且 size 不保险，不做内容/大小比对；
+          # 有同名旧附件先删再传，保证 Gitee 与 GitHub 最终一致。
           current = list_attachments(rid)
           current_by_name = {}
           for att in current:
@@ -550,26 +527,10 @@ jobs:
               filename = asset["name"]
               expected_names.add(filename)
               old = current_by_name.get(filename)
-              need_upload = True
               if old is not None:
-                  try:
-                      remote_size = int(old.get("size"))
-                  except (TypeError, ValueError):
-                      remote_size = -1
-                  if remote_size == int(asset["size"]):
-                      try:
-                          if remote_sha256(gee_urls[filename]) == local_sha256(asset):
-                              need_upload = False
-                      except Exception:
-                          # 下载远端失败时，仅靠大小一致判断，避免阻断同步。
-                          need_upload = False
-              if need_upload:
-                  if old is not None:
-                      gee_api("DELETE", f"{base}/releases/{rid}/attach_files/{old['id']}", missing=True)
-                  upload(f"{base}/releases/{rid}/attach_files", pathlib.Path("assets") / filename)
-                  print(f"Gitee asset uploaded: {filename}")
-              else:
-                  print(f"Gitee asset unchanged, skipped: {filename}")
+                  gee_api("DELETE", f"{base}/releases/{rid}/attach_files/{old['id']}", missing=True)
+              upload(f"{base}/releases/{rid}/attach_files", pathlib.Path("assets") / filename)
+              print(f"Gitee asset uploaded: {filename}")
           # 清理 Gitee 上多余的附件（GitHub 已没有的），让编辑同步收敛。
           for att in current:
               nm = att.get("name")
