@@ -223,7 +223,7 @@ jobs:
             # Gitee 没有独立的 Package 存储，附件随 Release 删除而清除，无需跨 Release 清扫。
             # Tag 的删除在下方 Bash 中根据 GitHub tag 是否仍在决定（Gitee 用 git push 删 tag）。
             print(f"Gitee: release deletion completed: {tag}")
-            PY
+          PY
             # 仅当 GitHub 上该 Tag 也不存在时，才删除 Gitee 的 Tag（Gitee 用 git push 删 tag）。
             if ! git -C source.git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
               git -C source.git push --force "$target_url" ":refs/tags/$RELEASE_TAG" || true
@@ -636,5 +636,5 @@ jobs:
             else:
                 print(f"Gitee release absent: {tag}")
             print(f"Gitee: tag only (no release) synced: {tag}")
-            PY
+          PY
           fi
