@@ -148,7 +148,12 @@ jobs:
                               return None
                           retryable = error.code == 429 or 500 <= error.code <= 599
                           if not retryable or attempt == 2:
-                              raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
+                              detail = ""
+                              try:
+                                  detail = error.read().decode("utf-8", "replace")[:500]
+                              except Exception:
+                                  pass
+                              raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
                       except urllib.error.URLError:
                           if attempt == 2:
                               raise RuntimeError("Gitee network request failed") from None
@@ -165,7 +170,12 @@ jobs:
                   except urllib.error.HTTPError as error:
                       if missing and error.code == 404:
                           return None
-                      raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
+                      detail = ""
+                      try:
+                          detail = error.read().decode("utf-8", "replace")[:500]
+                      except Exception:
+                          pass
+                      raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
                   except urllib.error.URLError:
                       raise RuntimeError("Gitee network request failed") from None
 
@@ -406,7 +416,12 @@ jobs:
                               return None
                           retryable = error.code == 429 or 500 <= error.code <= 599
                           if not retryable or attempt == 2:
-                              raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
+                              detail = ""
+                              try:
+                                  detail = error.read().decode("utf-8", "replace")[:500]
+                              except Exception:
+                                  pass
+                              raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
                       except urllib.error.URLError:
                           if attempt == 2:
                               raise RuntimeError("Gitee network request failed") from None
@@ -423,7 +438,12 @@ jobs:
                   except urllib.error.HTTPError as error:
                       if missing and error.code == 404:
                           return None
-                      raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
+                      detail = ""
+                      try:
+                          detail = error.read().decode("utf-8", "replace")[:500]
+                      except Exception:
+                          pass
+                      raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
                   except urllib.error.URLError:
                       raise RuntimeError("Gitee network request failed") from None
 
@@ -598,7 +618,12 @@ jobs:
                               return None
                           retryable = error.code == 429 or 500 <= error.code <= 599
                           if not retryable or attempt == 2:
-                              raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
+                              detail = ""
+                              try:
+                                  detail = error.read().decode("utf-8", "replace")[:500]
+                              except Exception:
+                                  pass
+                              raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
                       except urllib.error.URLError:
                           if attempt == 2:
                               raise RuntimeError("Gitee network request failed") from None
@@ -615,7 +640,12 @@ jobs:
                   except urllib.error.HTTPError as error:
                       if missing and error.code == 404:
                           return None
-                      raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code}")) from None
+                      detail = ""
+                      try:
+                          detail = error.read().decode("utf-8", "replace")[:500]
+                      except Exception:
+                          pass
+                      raise RuntimeError(redact(f"Gitee API {method} failed: HTTP {error.code} {detail}")) from None
                   except urllib.error.URLError:
                       raise RuntimeError("Gitee network request failed") from None
 
