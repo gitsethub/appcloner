@@ -101,9 +101,6 @@ jobs:
           SH
           chmod 700 "$RUNNER_TEMP/release-askpass.sh"
           export GIT_ASKPASS="$RUNNER_TEMP/release-askpass.sh"
-          # 隔离 runner 上的系统级/全局级 Git 配置与凭据助手、钩子，避免 GCM 或全局配置干扰推送。
-          export GIT_CONFIG_NOSYSTEM=1
-          export GIT_CONFIG_GLOBAL=/dev/null
 
           # 推送账号、令牌和目标仓库。Gitee 用户名必须是令牌所属账号的实际登录名。
           test -n "$GITEE_TOKEN"
