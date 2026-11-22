@@ -1,0 +1,218 @@
+name: Sync Repositories To GitLab Gitee
+
+on:
+  push:
+  create:
+  delete:
+  workflow_dispatch:
+    inputs:
+      sync_notice:
+        description: "修改GitHub简介和默认分支，需等待下次自动或手动运行才能同步"
+        type: choice
+        required: false
+        default: "立即同步（始终以 GitHub 为准）"
+        options:
+          - "立即同步（始终以 GitHub 为准）"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-main
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Align GitHub master with main
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      metadata: ${{ steps.metadata.outputs.metadata }}
+    steps:
+      - name: Align master with main without backup
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SYNC_USERNAME: x-access-token
+          SYNC_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/git-askpass.sh" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' "$SYNC_USERNAME" ;;
+            *Password*) printf '%s\n' "$SYNC_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          chmod 700 "$RUNNER_TEMP/git-askpass.sh"
+          export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          git clone --bare "https://github.com/${SOURCE_REPOSITORY}.git" source.git
+          cd source.git
+          main_sha=$(git rev-parse --verify refs/heads/main)
+          old_master=""
+          if git show-ref --verify --quiet refs/heads/master; then
+            old_master=$(git rev-parse refs/heads/master)
+            if [ "$old_master" = "$main_sha" ]; then
+              exit 0
+            fi
+          fi
+          git push --force \
+            origin refs/heads/main:refs/heads/master
+
+      - name: Read GitHub description and default branch
+        id: metadata
+        shell: python
+        env:
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import json
+          import os
+          import urllib.request
+
+          request = urllib.request.Request(
+              "https://api.github.com/repos/" + os.environ["SOURCE_REPOSITORY"],
+              headers={
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(request, timeout=60) as response:
+              repo = json.load(response)
+          metadata = {
+              "description": repo.get("description") or "",
+              "default_branch": repo["default_branch"],
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("metadata=" + json.dumps(metadata, ensure_ascii=True) + "\n")
+
+  sync:
+    name: Sync to ${{ matrix.target }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: GitLab
+            url: https://gitlab.com/gitsethub/AppCloner.git
+            api: https://gitlab.com/api/v4/projects/gitsethub%2FAppCloner
+            username: oauth2
+            secret: GITLAB_TOKEN_HAVE_ALL_PERMISSIONS
+          - target: Gitee
+            url: https://gitee.com/gitsethub/AppCloner.git
+            api: https://gitee.com/api/v5/repos/gitsethub/AppCloner
+            username: gitsethub
+            secret: GITEE_TOKEN_HAVE_ALL_PERMISSIONS
+
+    steps:
+      - name: Fetch all GitHub branches and tags
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SYNC_USERNAME: x-access-token
+          SYNC_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/git-askpass.sh" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' "$SYNC_USERNAME" ;;
+            *Password*) printf '%s\n' "$SYNC_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          chmod 700 "$RUNNER_TEMP/git-askpass.sh"
+          export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          git clone --bare "https://github.com/${SOURCE_REPOSITORY}.git" source.git
+          cd source.git
+          main_sha=$(git rev-parse --verify refs/heads/main)
+          git update-ref refs/heads/master "$main_sha"
+
+      - name: Push all branches and tags without deleting refs
+        shell: bash
+        env:
+          TARGET_URL: ${{ matrix.url }}
+          SYNC_USERNAME: ${{ matrix.username }}
+          SYNC_TOKEN: ${{ secrets[matrix.secret] }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          test -n "$SYNC_TOKEN" || { echo "Missing target token"; exit 1; }
+          export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          cd source.git
+          # Tag 由 Sync Releases To GitLab 工作流专职同步，这里只同步分支，避免与该工作流重复推送 Tag。
+          git push --force "$TARGET_URL" \
+            'refs/heads/*:refs/heads/*'
+
+      - name: Sync description and default branch
+        shell: python
+        env:
+          TARGET: ${{ matrix.target }}
+          TARGET_API: ${{ matrix.api }}
+          SYNC_TOKEN: ${{ secrets[matrix.secret] }}
+          SOURCE_METADATA: ${{ needs.prepare.outputs.metadata }}
+        run: |
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          target = os.environ["TARGET"]
+          api = os.environ["TARGET_API"]
+          token = os.environ["SYNC_TOKEN"]
+          metadata = json.loads(os.environ["SOURCE_METADATA"])
+
+          def request(method, url, payload=None, headers=None):
+              data = None
+              headers = dict(headers or {})
+              if payload is not None:
+                  data = urllib.parse.urlencode(payload).encode("utf-8")
+                  headers["Content-Type"] = "application/x-www-form-urlencoded"
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  sys.exit(f"{target} metadata API failed: HTTP {error.code}; check token API permissions and repository role")
+              except (urllib.error.URLError, TimeoutError):
+                  sys.exit(f"{target} metadata API network failure; rerun the workflow")
+
+          if target == "GitLab":
+              result = request("PUT", api, metadata, {"PRIVATE-TOKEN": token})
+          else:
+              existing = request("GET", api + "?" + urllib.parse.urlencode({"access_token": token}))
+              payload = dict(metadata, name=existing["name"], access_token=token)
+              result = request("PATCH", api, payload)
+          for key, expected in metadata.items():
+              actual = result.get(key)
+              if key == "description":
+                  actual = actual or ""
+              if actual != expected:
+                  sys.exit(f"{target} metadata verification failed: {key}")
+          print(f"{target}: description and default branch synchronized")
+
+      - name: Delete branches and tags absent from GitHub
+        shell: bash
+        env:
+          TARGET_URL: ${{ matrix.url }}
+          SYNC_USERNAME: ${{ matrix.username }}
+          SYNC_TOKEN: ${{ secrets[matrix.secret] }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          test -n "$SYNC_TOKEN" || { echo "Missing target token"; exit 1; }
+          export GIT_ASKPASS="$RUNNER_TEMP/git-askpass.sh"
+          cd source.git
+          # Tag 由 Sync Releases To GitLab 工作流专职同步，这里只修剪目标端多余的分支。
+          git push --force --prune "$TARGET_URL" \
+            'refs/heads/*:refs/heads/*'
