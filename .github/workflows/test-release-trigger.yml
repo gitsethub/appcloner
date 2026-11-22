@@ -1,0 +1,9 @@
+name: Test Release Trigger
+on:
+  release:
+    types: [edited]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "release edited event received"
