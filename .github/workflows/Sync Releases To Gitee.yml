@@ -24,7 +24,7 @@ on:
         required: true
         type: string
       retry_count:
-        description: "内部重试计数，手动运行无需填写；超过上限后停止重试。"
+        description: "内部重试计数，手动运行默认 0 无需填写无需修改；超过上限后停止重试。"
         required: false
         default: "0"
         type: string
