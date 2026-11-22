@@ -1,0 +1,9 @@
+{
+  "latestVersion": "3.2.1",
+  "latestDownloadUrl": "https://github.com/gitsethub/AppCloner/releases",
+  "latestUpdateMessage": "v3.2.1版本 修复已知bug。",
+  
+  "minRequiredVersion": "2.0.0",
+  "minDownloadUrl": "https://github.com/gitsethub/AppCloner/releases",
+  "minUpdateMessage": "您的版本过低（低于 2.0.0），必须更新才能继续使用。"
+}
